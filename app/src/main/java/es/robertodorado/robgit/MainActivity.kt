@@ -65,6 +65,7 @@ private fun DiagnosticScreen(
     var repositoryPrepared by remember { mutableStateOf<Boolean?>(null) }
     var preparationResult by remember { mutableStateOf<RepositoryPreparationResult?>(null) }
     var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
+    var downloadResult by remember { mutableStateOf<DownloadResult?>(null) }
     var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var pushResult by remember { mutableStateOf<DiagnosticResult?>(null) }
@@ -99,18 +100,22 @@ private fun DiagnosticScreen(
                         runningOperation = "preparar repositorio"
                         preparationResult = null
                         repositoryState = null
+                        downloadResult = null
                         scope.launch {
-                            val completed = withContext(Dispatchers.IO) {
-                                repositoryStateService.prepare(functionalRepository)
+                            try {
+                                val completed = withContext(Dispatchers.IO) {
+                                    repositoryStateService.prepare(functionalRepository)
+                                }
+                                preparationResult = completed
+                                repositoryPrepared = completed.success
+                                if (completed.success) {
+                                    Log.i("RobGitState", completed.message)
+                                } else {
+                                    Log.e("RobGitState", completed.error ?: completed.message)
+                                }
+                            } finally {
+                                runningOperation = null
                             }
-                            preparationResult = completed
-                            repositoryPrepared = completed.success
-                            if (completed.success) {
-                                Log.i("RobGitState", completed.message)
-                            } else {
-                                Log.e("RobGitState", completed.error ?: completed.message)
-                            }
-                            runningOperation = null
                         }
                     },
                     enabled = runningOperation == null,
@@ -124,17 +129,21 @@ private fun DiagnosticScreen(
                     onClick = {
                         runningOperation = "actualizar estado"
                         repositoryState = null
+                        downloadResult = null
                         scope.launch {
-                            val completed = withContext(Dispatchers.IO) {
-                                repositoryStateService.refreshState(functionalRepository)
+                            try {
+                                val completed = withContext(Dispatchers.IO) {
+                                    repositoryStateService.refreshState(functionalRepository)
+                                }
+                                repositoryState = completed
+                                if (completed.error == null) {
+                                    Log.i("RobGitState", "${completed.type}: ${completed.message}")
+                                } else {
+                                    Log.e("RobGitState", completed.error)
+                                }
+                            } finally {
+                                runningOperation = null
                             }
-                            repositoryState = completed
-                            if (completed.error == null) {
-                                Log.i("RobGitState", "${completed.type}: ${completed.message}")
-                            } else {
-                                Log.e("RobGitState", completed.error)
-                            }
-                            runningOperation = null
                         }
                     },
                     enabled = runningOperation == null,
@@ -144,7 +153,10 @@ private fun DiagnosticScreen(
                     Text("ACTUALIZAR ESTADO")
                 }
             }
-            if (runningOperation == "preparar repositorio" || runningOperation == "actualizar estado") {
+            if (runningOperation == "preparar repositorio" ||
+                runningOperation == "actualizar estado" ||
+                runningOperation == "descargar"
+            ) {
                 Text("Consultando repositorio…")
             }
             preparationResult?.let { result ->
@@ -152,6 +164,49 @@ private fun DiagnosticScreen(
                 result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
             }
             repositoryState?.let { RepositoryStatePanel(it) }
+            if (repositoryPrepared == true) {
+                val canDownload = repositoryState?.let { state ->
+                    state.type == RepositoryStateType.REMOTE_AHEAD &&
+                        state.relation == CommitRelation.REMOTE_AHEAD &&
+                        state.remoteStateIsFresh &&
+                        !state.changes.hasChanges &&
+                        state.ahead == 0 &&
+                        state.behind > 0
+                } == true
+                Button(
+                    onClick = {
+                        runningOperation = "descargar"
+                        downloadResult = null
+                        scope.launch {
+                            try {
+                                val completed = withContext(Dispatchers.IO) {
+                                    repositoryStateService.downloadFastForward(functionalRepository)
+                                }
+                                downloadResult = completed
+                                completed.finalState?.let { repositoryState = it }
+                                if (completed.outcome == DownloadOutcome.SUCCESS ||
+                                    completed.outcome == DownloadOutcome.ALREADY_SYNCHRONIZED
+                                ) {
+                                    Log.i("RobGitState", "${completed.outcome}: ${completed.message}")
+                                } else {
+                                    Log.w(
+                                        "RobGitState",
+                                        "${completed.outcome}: ${completed.error ?: completed.message}",
+                                    )
+                                }
+                            } finally {
+                                runningOperation = null
+                            }
+                        }
+                    },
+                    enabled = runningOperation == null && canDownload,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(16.dp),
+                ) {
+                    Text("↓ DESCARGAR")
+                }
+            }
+            DownloadResultPanel(downloadResult)
 
             Text("Herramientas de diagnóstico", style = MaterialTheme.typography.headlineSmall)
             Text("Prueba local", style = MaterialTheme.typography.titleLarge)
@@ -308,6 +363,29 @@ private fun StateFiles(label: String, files: Set<String>) {
     if (files.isNotEmpty()) {
         Text("$label (${files.size}): ${files.joinToString()}")
     }
+}
+
+@Composable
+private fun DownloadResultPanel(result: DownloadResult?) {
+    result ?: return
+    val prefix = when (result.outcome) {
+        DownloadOutcome.SUCCESS -> "✓"
+        DownloadOutcome.ALREADY_SYNCHRONIZED -> "="
+        else -> "⚠"
+    }
+    Text("$prefix ${result.message}")
+    Text("Resultado: ${result.outcome}")
+    if (result.previousHead != null || result.newHead != null) {
+        Text(
+            "HEAD: ${result.previousHead?.take(7) ?: "desconocido"} → " +
+                (result.newHead?.take(7) ?: "desconocido"),
+        )
+    }
+    if (result.outcome == DownloadOutcome.SUCCESS) {
+        Text("Commits descargados: ${result.commitsDownloaded}")
+        Text("Working tree limpio: ${if (result.workingTreeClean) "sí" else "no"}")
+    }
+    result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
 }
 
 @Composable

@@ -14,13 +14,11 @@ import java.io.File
 class RepositoryStateServiceTest {
     @get:Rule val temporaryFolder = TemporaryFolder()
 
-    private val service = RepositoryStateService()
-
     @Test
     fun synchronizedWhenHeadsMatchAndTreeIsClean() {
         val fixture = fixture()
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertState(state, RepositoryStateType.SYNCHRONIZED, CommitRelation.SYNCHRONIZED, 0, 0)
         assertFalse(state.changes.hasChanges)
@@ -31,7 +29,7 @@ class RepositoryStateServiceTest {
         val fixture = fixture()
         File(fixture.local, "nuevo.txt").writeText("nuevo")
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertEquals(RepositoryStateType.LOCAL_CHANGES, state.type)
         assertEquals(setOf("nuevo.txt"), state.changes.newFiles)
@@ -44,7 +42,7 @@ class RepositoryStateServiceTest {
         val fixture = fixture()
         File(fixture.local, "tracked.txt").writeText("modificado")
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertEquals(RepositoryStateType.LOCAL_CHANGES, state.type)
         assertEquals(setOf("tracked.txt"), state.changes.modifiedFiles)
@@ -57,7 +55,7 @@ class RepositoryStateServiceTest {
         val fixture = fixture()
         assertTrue(File(fixture.local, "tracked.txt").delete())
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertEquals(RepositoryStateType.LOCAL_CHANGES, state.type)
         assertEquals(setOf("tracked.txt"), state.changes.deletedFiles)
@@ -70,7 +68,7 @@ class RepositoryStateServiceTest {
         val fixture = fixture()
         commit(fixture.local, "local-1.txt", "local 1", "local 1")
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertState(state, RepositoryStateType.LOCAL_AHEAD, CommitRelation.LOCAL_AHEAD, 1, 0)
     }
@@ -80,7 +78,7 @@ class RepositoryStateServiceTest {
         val fixture = fixture()
         commitAndPush(fixture.writer, "remote-1.txt", "remote 1", "remote 1")
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertState(state, RepositoryStateType.REMOTE_AHEAD, CommitRelation.REMOTE_AHEAD, 0, 1)
     }
@@ -92,7 +90,7 @@ class RepositoryStateServiceTest {
             commit(fixture.local, "local-$index.txt", "local $index", "local $index")
         }
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertState(state, RepositoryStateType.LOCAL_AHEAD, CommitRelation.LOCAL_AHEAD, 3, 0)
     }
@@ -105,7 +103,7 @@ class RepositoryStateServiceTest {
         }
         push(fixture.writer)
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertState(state, RepositoryStateType.REMOTE_AHEAD, CommitRelation.REMOTE_AHEAD, 0, 3)
     }
@@ -116,7 +114,7 @@ class RepositoryStateServiceTest {
         commit(fixture.local, "local.txt", "solo local", "solo local")
         commitAndPush(fixture.writer, "remote.txt", "solo remoto", "solo remoto")
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertState(state, RepositoryStateType.DIVERGED, CommitRelation.DIVERGED, 1, 1)
     }
@@ -127,7 +125,7 @@ class RepositoryStateServiceTest {
         File(fixture.local, "staged.txt").writeText("staged")
         Git.open(fixture.local).use { it.add().addFilepattern("staged.txt").call() }
 
-        val state = service.refreshState(fixture.local)
+        val state = fixture.service.refreshState(fixture.local)
 
         assertEquals(RepositoryStateType.LOCAL_CHANGES, state.type)
         assertEquals(setOf("staged.txt"), state.changes.newFiles)
@@ -137,17 +135,19 @@ class RepositoryStateServiceTest {
     @Test
     fun fetchFailureNeverReportsSynchronizedState() {
         val fixture = fixture()
+        val missingRemote = File(temporaryFolder.root, "missing.git")
         Git.open(fixture.local).use { git ->
             git.repository.config.setString(
                 "remote",
                 "origin",
                 "url",
-                File(temporaryFolder.root, "missing.git").toURI().toString(),
+                missingRemote.toURI().toString(),
             )
             git.repository.config.save()
         }
 
-        val state = service.refreshState(fixture.local)
+        val state = RepositoryStateService(missingRemote.toURI().toString())
+            .refreshState(fixture.local)
 
         assertEquals(RepositoryStateType.ERROR, state.type)
         assertEquals(CommitRelation.UNDETERMINED, state.relation)
@@ -185,6 +185,200 @@ class RepositoryStateServiceTest {
         assertFalse(File(target, ".git").exists())
     }
 
+    @Test
+    fun downloadOneRemoteCommitByFastForward() {
+        val fixture = fixture()
+        val previousHead = head(fixture.local)
+        commitAndPush(fixture.writer, "tracked.txt", "remoto 1", "remoto 1")
+        val remoteHead = head(fixture.writer)
+        val remoteCommitCount = commitCount(fixture.writer)
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(result.error, DownloadOutcome.SUCCESS, result.outcome)
+        assertEquals(previousHead, result.previousHead)
+        assertEquals(remoteHead, result.newHead)
+        assertEquals(1, result.commitsDownloaded)
+        assertEquals("remoto 1", File(fixture.local, "tracked.txt").readText())
+        assertRepositoryAt(fixture.local, remoteHead, remoteCommitCount)
+        assertState(
+            requireNotNull(result.finalState),
+            RepositoryStateType.SYNCHRONIZED,
+            CommitRelation.SYNCHRONIZED,
+            0,
+            0,
+        )
+    }
+
+    @Test
+    fun downloadSeveralRemoteCommitsByFastForward() {
+        val fixture = fixture()
+        repeat(3) { index ->
+            commit(fixture.writer, "remote-$index.txt", "contenido $index", "remoto $index")
+        }
+        push(fixture.writer)
+        val remoteHead = head(fixture.writer)
+        val remoteCommitCount = commitCount(fixture.writer)
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(result.error, DownloadOutcome.SUCCESS, result.outcome)
+        assertEquals(3, result.commitsDownloaded)
+        repeat(3) { index ->
+            assertEquals("contenido $index", File(fixture.local, "remote-$index.txt").readText())
+        }
+        assertRepositoryAt(fixture.local, remoteHead, remoteCommitCount)
+    }
+
+    @Test
+    fun downloadWhenSynchronizedIsIdempotent() {
+        val fixture = fixture()
+        val previousHead = head(fixture.local)
+        val previousContents = File(fixture.local, "tracked.txt").readText()
+        val previousCommitCount = commitCount(fixture.local)
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.ALREADY_SYNCHRONIZED, result.outcome)
+        assertEquals(0, result.commitsDownloaded)
+        assertEquals(previousContents, File(fixture.local, "tracked.txt").readText())
+        assertRepositoryAt(fixture.local, previousHead, previousCommitCount)
+    }
+
+    @Test
+    fun downloadIsBlockedByModifiedLocalFile() {
+        val fixture = fixture()
+        commitAndPush(fixture.writer, "remote.txt", "remoto", "remoto")
+        val remoteHead = head(fixture.writer)
+        val localHead = head(fixture.local)
+        File(fixture.local, "tracked.txt").writeText("cambio local sin commit")
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.BLOCKED_LOCAL_CHANGES, result.outcome)
+        assertEquals(localHead, head(fixture.local))
+        assertEquals(remoteHead, originMain(fixture.local))
+        assertEquals("cambio local sin commit", File(fixture.local, "tracked.txt").readText())
+        assertEquals(setOf("tracked.txt"), status(fixture.local).modified)
+    }
+
+    @Test
+    fun downloadIsBlockedByUntrackedFileAndKeepsIt() {
+        val fixture = fixture()
+        commitAndPush(fixture.writer, "remote.txt", "remoto", "remoto")
+        val localHead = head(fixture.local)
+        val untracked = File(fixture.local, "sin-seguimiento.txt")
+        untracked.writeText("conservar")
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.BLOCKED_LOCAL_CHANGES, result.outcome)
+        assertEquals(localHead, head(fixture.local))
+        assertTrue(untracked.isFile)
+        assertEquals("conservar", untracked.readText())
+        assertEquals(setOf("sin-seguimiento.txt"), status(fixture.local).untracked)
+    }
+
+    @Test
+    fun downloadIsBlockedByStagedChangeAndKeepsIndex() {
+        val fixture = fixture()
+        commitAndPush(fixture.writer, "remote.txt", "remoto", "remoto")
+        val localHead = head(fixture.local)
+        val staged = File(fixture.local, "staged.txt")
+        staged.writeText("staged local")
+        Git.open(fixture.local).use { it.add().addFilepattern("staged.txt").call() }
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.BLOCKED_LOCAL_CHANGES, result.outcome)
+        assertEquals(localHead, head(fixture.local))
+        assertEquals("staged local", staged.readText())
+        assertEquals(setOf("staged.txt"), status(fixture.local).added)
+    }
+
+    @Test
+    fun downloadIsBlockedWhenLocalHasCommits() {
+        val fixture = fixture()
+        commit(fixture.local, "local.txt", "solo local", "solo local")
+        val localHead = head(fixture.local)
+        val localCommitCount = commitCount(fixture.local)
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.BLOCKED_LOCAL_COMMITS, result.outcome)
+        assertRepositoryAt(fixture.local, localHead, localCommitCount, expectSynchronized = false)
+        assertEquals("solo local", File(fixture.local, "local.txt").readText())
+    }
+
+    @Test
+    fun downloadIsBlockedOnDivergenceWithoutMergeCommit() {
+        val fixture = fixture()
+        commit(fixture.local, "local.txt", "solo local", "solo local")
+        val localHead = head(fixture.local)
+        val localCommitCount = commitCount(fixture.local)
+        commitAndPush(fixture.writer, "remote.txt", "solo remoto", "solo remoto")
+        val remoteHead = head(fixture.writer)
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.DIVERGED, result.outcome)
+        assertEquals(localHead, head(fixture.local))
+        assertEquals(remoteHead, originMain(fixture.local))
+        assertEquals(localCommitCount, commitCount(fixture.local))
+        assertEquals("solo local", File(fixture.local, "local.txt").readText())
+        assertFalse(File(fixture.local, "remote.txt").exists())
+        assertTrue(status(fixture.local).isClean)
+    }
+
+    @Test
+    fun downloadFetchFailureDoesNotChangeHeadRefsOrFiles() {
+        val fixture = fixture()
+        val localHead = head(fixture.local)
+        val trackedRemote = originMain(fixture.local)
+        val contents = File(fixture.local, "tracked.txt").readText()
+        val missingRemote = File(temporaryFolder.root, "download-missing.git")
+        Git.open(fixture.local).use { git ->
+            git.repository.config.setString(
+                "remote",
+                "origin",
+                "url",
+                missingRemote.toURI().toString(),
+            )
+            git.repository.config.save()
+        }
+
+        val result = RepositoryStateService(missingRemote.toURI().toString())
+            .downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.FETCH_ERROR, result.outcome)
+        assertEquals(localHead, head(fixture.local))
+        assertEquals(trackedRemote, originMain(fixture.local))
+        assertEquals(contents, File(fixture.local, "tracked.txt").readText())
+        assertTrue(status(fixture.local).isClean)
+    }
+
+    @Test
+    fun downloadRevalidatesStaleShownStateBeforeActing() {
+        val fixture = fixture()
+        commitAndPush(fixture.writer, "remote.txt", "remoto", "remoto")
+        val remoteHead = head(fixture.writer)
+        val shownState = fixture.service.refreshState(fixture.local)
+        assertEquals(RepositoryStateType.REMOTE_AHEAD, shownState.type)
+        val localHead = head(fixture.local)
+        File(fixture.local, "tracked.txt").writeText("cambio posterior al estado mostrado")
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.BLOCKED_LOCAL_CHANGES, result.outcome)
+        assertEquals(localHead, head(fixture.local))
+        assertEquals(remoteHead, originMain(fixture.local))
+        assertEquals(
+            "cambio posterior al estado mostrado",
+            File(fixture.local, "tracked.txt").readText(),
+        )
+        assertEquals(setOf("tracked.txt"), status(fixture.local).modified)
+    }
+
     private fun fixture(): Fixture {
         val root = temporaryFolder.newFolder()
         val remote = File(root, "remote.git")
@@ -217,7 +411,12 @@ class RepositoryStateServiceTest {
             .setDirectory(local)
             .call()
             .close()
-        return Fixture(remote, writer, local)
+        return Fixture(
+            remote = remote,
+            writer = writer,
+            local = local,
+            service = RepositoryStateService(remote.toURI().toString()),
+        )
     }
 
     private fun commit(directory: File, path: String, contents: String, message: String) {
@@ -260,5 +459,40 @@ class RepositoryStateServiceTest {
         assertTrue(state.remoteStateIsFresh)
     }
 
-    private data class Fixture(val remote: File, val writer: File, val local: File)
+    private fun assertRepositoryAt(
+        directory: File,
+        expectedHead: String,
+        expectedCommitCount: Int,
+        expectSynchronized: Boolean = true,
+    ) {
+        assertEquals(expectedHead, head(directory))
+        if (expectSynchronized) {
+            assertEquals(expectedHead, originMain(directory))
+        }
+        assertEquals(expectedCommitCount, commitCount(directory))
+        assertTrue(status(directory).isClean)
+    }
+
+    private fun head(directory: File): String = Git.open(directory).use { git ->
+        requireNotNull(git.repository.resolve("HEAD")).name
+    }
+
+    private fun originMain(directory: File): String = Git.open(directory).use { git ->
+        requireNotNull(git.repository.resolve("refs/remotes/origin/main")).name
+    }
+
+    private fun commitCount(directory: File): Int = Git.open(directory).use { git ->
+        git.log().call().count()
+    }
+
+    private fun status(directory: File) = Git.open(directory).use { git ->
+        git.status().call()
+    }
+
+    private data class Fixture(
+        val remote: File,
+        val writer: File,
+        val local: File,
+        val service: RepositoryStateService,
+    )
 }

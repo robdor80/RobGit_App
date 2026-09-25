@@ -25,3 +25,9 @@ Los tests JVM comprueban el contenido local dentro del commit, que la prueba no 
 La sección **RobGit — Estado del repositorio** prepara una única copia persistente de `robdor80/Robgit.pruebas` en `filesDir/repos/robgit-pruebas`. Si la carpeta ya existe, la abre y nunca clona encima ni elimina su contenido.
 
 **ACTUALIZAR ESTADO** realiza primero un `fetch` y después calcula la relación real del grafo entre `HEAD` y `origin/main`: sincronizado, local adelantado, remoto adelantado o divergente, con el número de commits exclusivos de cada lado. El working tree se representa por separado mediante archivos nuevos, modificados, eliminados, staged y en conflicto. Si el fetch falla, el resultado es `ERROR` y nunca se presenta como sincronizado.
+
+Cuando el estado conocido indica que GitHub está adelantado, la rama es `main`, el working tree está limpio y no hay commits locales pendientes, se habilita **↓ DESCARGAR**. La operación no confía en ese estado mostrado: vuelve a ejecutar `fetch`, recalcula el grafo y revalida todas las condiciones antes de aplicar exclusivamente un fast-forward con `FastForwardMode.FF_ONLY`.
+
+DESCARGAR no usa `pull`, `reset`, `force`, stash, checkout destructivo ni crea commits de merge. Se bloquea ante cambios locales, commits locales o divergencia; distingue también repositorio ya sincronizado, error de fetch y error general. Tras un fast-forward verifica que `HEAD` coincide exactamente con `origin/main`, que ahead/behind son cero y que el working tree está limpio.
+
+La suite JVM incluye escenarios deterministas con remotos Git locales para un commit remoto, varios commits, operación idempotente, archivos modificados, untracked y staged, commits locales, divergencia, fallo de fetch y estado de UI obsoleto. También verifica contenido, refs, limpieza del working tree y ausencia de commits extra.
