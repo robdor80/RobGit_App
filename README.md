@@ -1,6 +1,6 @@
 # RobGit — spike JGit en Android
 
-Este proyecto comprueba operaciones **locales** de Eclipse JGit 7.8 dentro de una app Android. No conecta con GitHub ni contiene autenticación.
+Este proyecto comprueba operaciones locales y un clone HTTPS anónimo de solo lectura de `https://github.com/robdor80/RobGit_App.git` mediante Eclipse JGit 7.8. No contiene autenticación ni operaciones que escriban en GitHub.
 
 ## Compilar y probar
 
@@ -12,6 +12,8 @@ Se necesitan Android SDK 36, JDK 17 y Android API 34 o superior en el dispositiv
 
 La APK queda en `app/build/outputs/apk/debug/app-debug.apk`.
 
-Al pulsar **EJECUTAR PRUEBA LOCAL**, la app crea un repositorio nuevo bajo `filesDir/diagnostics/<uuid>` y comprueba inicialización, rama/HEAD, archivo nuevo, estado, índice, commit, árbol limpio y lectura del último commit. Cada ejecución usa un directorio independiente. La pantalla muestra los pasos y el error concreto; Logcat usa la etiqueta `RobGitDiagnostic`.
+**EJECUTAR PRUEBA LOCAL** crea un repositorio nuevo bajo `filesDir/diagnostics/<uuid>` y comprueba inicialización, rama/HEAD, archivo nuevo, estado, índice, commit, árbol limpio y lectura del último commit.
 
-La prueba JVM comprueba también el contenido del archivo dentro del commit. La compatibilidad real con Android sigue pendiente hasta ejecutar la APK en la Galaxy Tab S9+.
+**EJECUTAR PRUEBA REMOTA** clona el repositorio público indicado bajo `filesDir/diagnostics/remote-clones/<uuid>`, sin proveedor de credenciales. Comprueba el repo Git, `HEAD`, rama `main`, URL de `origin`, `origin/main`, igualdad de commits, árbol limpio, `README.md` y el último commit. Ambas acciones se ejecutan en segundo plano y muestran los pasos y errores. Logcat usa la etiqueta `RobGitDiagnostic`.
+
+Los tests JVM comprueban el contenido local dentro del commit y que la prueba no utilice una carpeta ya existente. El clone remoto no se ejecuta en la suite JVM: debe probarse desde la app en la Galaxy Tab S9+.

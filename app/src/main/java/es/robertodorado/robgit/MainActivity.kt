@@ -45,8 +45,9 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
-    var result by remember { mutableStateOf<DiagnosticResult?>(null) }
-    var running by remember { mutableStateOf(false) }
+    var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
+    var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
+    var runningOperation by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     Scaffold { padding ->
@@ -59,47 +60,89 @@ private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             Text("RobGit — Diagnóstico JGit", style = MaterialTheme.typography.headlineSmall)
-            Text("JGit: ${if (running) "ejecutando" else if (result == null) "pendiente" else if (result?.error == null) "correcto" else "error"}")
-            Text("Repositorio local: ${result?.repositoryPath ?: "pendiente"}")
-            Text("Rama: ${result?.branch ?: "pendiente"}")
-            Text("Último commit: ${result?.lastCommit ?: "pendiente"}")
-            Text("Estado: ${result?.status ?: "pendiente"}")
-
+            Text("Prueba local", style = MaterialTheme.typography.titleLarge)
             Button(
                 onClick = {
-                    running = true
-                    result = null
+                    runningOperation = "local"
+                    localResult = null
                     val directory = File(root, UUID.randomUUID().toString())
                     scope.launch {
                         try {
                             val completed = withContext(Dispatchers.IO) {
                                 service.runLocalDiagnostic(directory)
                             }
-                            result = completed
-                            completed.steps.forEach { Log.i("RobGitDiagnostic", it.description + ": " + it.detail) }
-                            completed.error?.let { Log.e("RobGitDiagnostic", it) }
+                            localResult = completed
+                            logResult("local", completed)
                         } catch (error: Throwable) {
                             if (error !is Exception && error !is LinkageError) throw error
-                            val detail = "${error.javaClass.simpleName}: ${error.message ?: "sin detalle"}"
-                            result = DiagnosticResult(directory.absolutePath, "Sin consultar", "Sin commits", "Error", emptyList(), detail)
-                            Log.e("RobGitDiagnostic", "Error inesperado durante la prueba", error)
+                            val detail = describeFailure(error)
+                            localResult = DiagnosticResult(directory.absolutePath, "Sin consultar", "Sin commits", "Error", emptyList(), detail)
+                            Log.e("RobGitDiagnostic", "Fallo en la prueba local: $detail", error)
                         } finally {
-                            running = false
+                            runningOperation = null
                         }
                     }
                 },
-                enabled = !running,
+                enabled = runningOperation == null,
                 modifier = Modifier.fillMaxWidth(),
                 contentPadding = PaddingValues(16.dp),
             ) {
                 Text("EJECUTAR PRUEBA LOCAL")
             }
+            DiagnosticResultPanel(localResult, runningOperation == "local")
 
-            Text("Resultados", style = MaterialTheme.typography.titleMedium)
-            result?.steps?.forEach { step ->
-                Text("✓ ${step.description}${if (step.detail.isBlank()) "" else ": ${step.detail}"}")
+            Text("Clone HTTPS de GitHub (solo lectura)", style = MaterialTheme.typography.titleLarge)
+            Button(
+                onClick = {
+                    runningOperation = "remoto"
+                    remoteResult = null
+                    val directory = File(File(root, "remote-clones"), UUID.randomUUID().toString())
+                    scope.launch {
+                        try {
+                            val completed = withContext(Dispatchers.IO) {
+                                service.runRemoteCloneDiagnostic(directory)
+                            }
+                            remoteResult = completed
+                            logResult("remoto", completed)
+                        } catch (error: Throwable) {
+                            if (error !is Exception && error !is LinkageError) throw error
+                            val detail = describeFailure(error)
+                            remoteResult = DiagnosticResult(directory.absolutePath, "Sin consultar", "Sin leer", "Error", emptyList(), detail)
+                            Log.e("RobGitDiagnostic", "Fallo en la prueba remota: $detail", error)
+                        } finally {
+                            runningOperation = null
+                        }
+                    }
+                },
+                enabled = runningOperation == null,
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(16.dp),
+            ) {
+                Text("EJECUTAR PRUEBA REMOTA")
             }
-            result?.error?.let { Text("✗ $it", color = MaterialTheme.colorScheme.error) }
+            DiagnosticResultPanel(remoteResult, runningOperation == "remoto")
         }
     }
 }
+
+@Composable
+private fun DiagnosticResultPanel(result: DiagnosticResult?, running: Boolean) {
+    Text("JGit: ${if (running) "ejecutando" else if (result == null) "pendiente" else if (result.error == null) "correcto" else "error"}")
+    Text("Directorio del repositorio: ${result?.repositoryPath ?: "pendiente"}")
+    Text("Rama: ${result?.branch ?: "pendiente"}")
+    Text("Último commit: ${result?.lastCommit ?: "pendiente"}")
+    Text("Estado: ${result?.status ?: "pendiente"}")
+    result?.steps?.forEach { step ->
+        Text("✓ ${step.description}${if (step.detail.isBlank()) "" else ": ${step.detail}"}")
+    }
+    result?.error?.let { Text("✗ $it", color = MaterialTheme.colorScheme.error) }
+}
+
+private fun logResult(operation: String, result: DiagnosticResult) {
+    result.steps.forEach { Log.i("RobGitDiagnostic", "$operation — ${it.description}: ${it.detail}") }
+    result.error?.let { Log.e("RobGitDiagnostic", "$operation — $it") }
+}
+
+private fun describeFailure(error: Throwable): String = generateSequence(error) { it.cause }
+    .take(5)
+    .joinToString(" ← ") { "${it.javaClass.name}: ${it.message ?: "sin detalle"}" }

@@ -4,6 +4,8 @@ import org.eclipse.jgit.api.Git
 import org.eclipse.jgit.lib.Constants
 import java.io.File
 
+private const val REMOTE_TEST_URL = "https://github.com/robdor80/RobGit_App.git"
+
 data class DiagnosticStep(val description: String, val detail: String = "")
 
 data class DiagnosticResult(
@@ -95,6 +97,113 @@ class GitRepositoryService {
                 status = status,
                 steps = steps,
                 error = detail,
+            )
+        }
+
+        return DiagnosticResult(
+            repositoryPath = repositoryDirectory.absolutePath,
+            branch = branch,
+            lastCommit = lastCommit,
+            status = status,
+            steps = steps,
+        )
+    }
+
+    fun runRemoteCloneDiagnostic(repositoryDirectory: File): DiagnosticResult {
+        val steps = mutableListOf<DiagnosticStep>()
+        var stage = "Preparando el clone HTTPS"
+        var branch = "Sin consultar"
+        var lastCommit = "Sin leer"
+        var status = "Sin consultar"
+
+        try {
+            require(!repositoryDirectory.exists()) {
+                "La carpeta de diagnóstico ya existe: ${repositoryDirectory.absolutePath}"
+            }
+
+            Git.cloneRepository()
+                .setURI(REMOTE_TEST_URL)
+                .setDirectory(repositoryDirectory)
+                .setCredentialsProvider(null)
+                .setTimeout(60)
+                .call().use {
+                    steps += DiagnosticStep("Conexión HTTPS", "Clone anónimo completado")
+                }
+
+            stage = "Abriendo y validando el repositorio clonado"
+            check(File(repositoryDirectory, ".git").isDirectory) {
+                "No existe el directorio .git del clone"
+            }
+            Git.open(repositoryDirectory).use { git ->
+                check(!git.repository.isBare && git.repository.objectDatabase.exists()) {
+                    "El directorio clonado no es un repositorio Git válido"
+                }
+                steps += DiagnosticStep("Repositorio clonado", "Repositorio Git válido")
+
+                stage = "Validando HEAD y rama"
+                val head = git.repository.resolve(Constants.HEAD)
+                check(head != null) { "El repositorio no tiene HEAD" }
+                branch = git.repository.branch
+                check(branch == "main") { "Se esperaba la rama main, se obtuvo $branch" }
+                steps += DiagnosticStep("Rama activa", branch)
+
+                stage = "Validando remoto origin"
+                val originUrl = git.repository.config.getString("remote", "origin", "url")
+                check(originUrl == REMOTE_TEST_URL) {
+                    "URL de origin inesperada: ${originUrl ?: "ausente"}"
+                }
+                steps += DiagnosticStep("origin configurado", originUrl)
+
+                stage = "Validando refs/remotes/origin/main"
+                val remoteMain = git.repository.exactRef("refs/remotes/origin/main")
+                check(remoteMain != null) { "No existe refs/remotes/origin/main" }
+                steps += DiagnosticStep("Rama remota encontrada", "origin/main")
+
+                stage = "Comparando HEAD con origin/main"
+                check(head == remoteMain.objectId) {
+                    "HEAD ($head) no coincide con origin/main (${remoteMain.objectId})"
+                }
+                steps += DiagnosticStep("HEAD coincide con origin/main", head.abbreviate(7).name())
+
+                stage = "Comprobando el working tree"
+                val finalStatus = git.status().call()
+                check(finalStatus.isClean) { "El working tree no está limpio: $finalStatus" }
+                status = "Working tree limpio"
+                steps += DiagnosticStep("Working tree limpio")
+
+                stage = "Comprobando README.md"
+                val readme = File(repositoryDirectory, "README.md")
+                check(readme.isFile && readme.length() > 0L) {
+                    "README.md no existe o está vacío"
+                }
+                readme.inputStream().use { stream ->
+                    val firstByte = stream.read()
+                    check(firstByte >= 0) { "README.md no se pudo leer" }
+                }
+                steps += DiagnosticStep("README.md encontrado y legible", "${readme.length()} bytes")
+
+                stage = "Leyendo el último commit"
+                val latest = git.log().setMaxCount(1).call().firstOrNull()
+                check(latest != null && latest.id == head) {
+                    "No se pudo leer el commit apuntado por HEAD"
+                }
+                lastCommit = "${latest.id.abbreviate(7).name()} — ${latest.shortMessage}"
+                steps += DiagnosticStep("Último commit leído", lastCommit)
+            }
+        } catch (failure: Throwable) {
+            if (failure !is Exception && failure !is LinkageError) throw failure
+            val causes = generateSequence(failure) { it.cause }
+                .take(5)
+                .joinToString(" ← ") {
+                    "${it.javaClass.name}: ${it.message ?: "sin detalle"}"
+                }
+            return DiagnosticResult(
+                repositoryPath = repositoryDirectory.absolutePath,
+                branch = branch,
+                lastCommit = lastCommit,
+                status = status,
+                steps = steps,
+                error = "$stage — $causes",
             )
         }
 
