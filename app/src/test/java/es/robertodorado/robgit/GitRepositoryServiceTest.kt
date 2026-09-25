@@ -47,4 +47,31 @@ class GitRepositoryServiceTest {
         assertTrue(result.steps.isEmpty())
         assertFalse(File(directory, ".git").exists())
     }
+
+    @Test
+    fun authenticatedErrorRedactsCredential() {
+        val token = "sensitive-value".toCharArray()
+        val error = GitRepositoryService().authenticatedError(
+            "Probando autenticación",
+            IllegalStateException("fallo con sensitive-value"),
+            token,
+        )
+
+        assertFalse(error.contains("sensitive-value"))
+        assertTrue(error.contains("[credencial oculta]"))
+        token.fill('\u0000')
+    }
+
+    @Test
+    fun authenticatedErrorExplainsRejectedCredentialsWithoutDetails() {
+        val token = "sensitive-value".toCharArray()
+        val error = GitRepositoryService().authenticatedError(
+            "Ejecutando push",
+            IllegalStateException("Authentication is required for sensitive-value"),
+            token,
+        )
+
+        assertEquals("GitHub rechazó las credenciales.", error)
+        token.fill('\u0000')
+    }
 }

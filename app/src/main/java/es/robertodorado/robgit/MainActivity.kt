@@ -14,6 +14,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -23,7 +24,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.text.KeyboardOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -47,6 +51,8 @@ class MainActivity : ComponentActivity() {
 private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
     var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
+    var pushResult by remember { mutableStateOf<DiagnosticResult?>(null) }
+    var token by remember { mutableStateOf("") }
     var runningOperation by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
@@ -121,6 +127,61 @@ private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
                 Text("EJECUTAR PRUEBA REMOTA")
             }
             DiagnosticResultPanel(remoteResult, runningOperation == "remoto")
+
+            Text("Push HTTPS autenticado", style = MaterialTheme.typography.titleLarge)
+            Text("Repositorio desechable: robdor80/Robgit.pruebas")
+            OutlinedTextField(
+                value = token,
+                onValueChange = { token = it },
+                label = { Text("GitHub Personal Access Token") },
+                visualTransformation = PasswordVisualTransformation(),
+                keyboardOptions = KeyboardOptions(
+                    keyboardType = KeyboardType.Password,
+                    autoCorrectEnabled = false,
+                ),
+                enabled = runningOperation == null,
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            Button(
+                onClick = {
+                    val tokenForRun = token.toCharArray()
+                    token = ""
+                    runningOperation = "push"
+                    pushResult = null
+                    val directory = File(File(root, "authenticated-pushes"), UUID.randomUUID().toString())
+                    scope.launch {
+                        try {
+                            val completed = withContext(Dispatchers.IO) {
+                                service.runAuthenticatedPushDiagnostic(directory, tokenForRun)
+                            }
+                            pushResult = completed
+                            logResult("push autenticado", completed)
+                        } catch (error: Throwable) {
+                            if (error !is Exception && error !is LinkageError) throw error
+                            pushResult = DiagnosticResult(
+                                directory.absolutePath,
+                                "Sin consultar",
+                                "Sin leer",
+                                "Error inesperado",
+                                emptyList(),
+                                "La prueba terminó con un error inesperado sin detalles sensibles.",
+                            )
+                            Log.e("RobGitDiagnostic", "Fallo inesperado en la prueba de push autenticado")
+                        } finally {
+                            tokenForRun.fill('\u0000')
+                            token = ""
+                            runningOperation = null
+                        }
+                    }
+                },
+                enabled = runningOperation == null && token.isNotBlank(),
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = PaddingValues(16.dp),
+            ) {
+                Text("PRUEBA PUSH AUTENTICADO")
+            }
+            DiagnosticResultPanel(pushResult, runningOperation == "push")
         }
     }
 }
