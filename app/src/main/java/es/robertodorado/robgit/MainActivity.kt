@@ -18,6 +18,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -39,22 +40,43 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val diagnosticRoot = File(filesDir, "diagnostics")
         val service = GitRepositoryService()
+        val repositoryStateService = RepositoryStateService()
+        val functionalRepository = File(filesDir, "repos/robgit-pruebas")
         setContent {
             MaterialTheme {
-                DiagnosticScreen(diagnosticRoot, service)
+                DiagnosticScreen(
+                    diagnosticRoot = diagnosticRoot,
+                    service = service,
+                    repositoryStateService = repositoryStateService,
+                    functionalRepository = functionalRepository,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
+private fun DiagnosticScreen(
+    diagnosticRoot: File,
+    service: GitRepositoryService,
+    repositoryStateService: RepositoryStateService,
+    functionalRepository: File,
+) {
+    var repositoryPrepared by remember { mutableStateOf<Boolean?>(null) }
+    var preparationResult by remember { mutableStateOf<RepositoryPreparationResult?>(null) }
+    var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
     var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var pushResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var token by remember { mutableStateOf("") }
     var runningOperation by remember { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(functionalRepository.absolutePath) {
+        repositoryPrepared = withContext(Dispatchers.IO) {
+            repositoryStateService.isPrepared(functionalRepository)
+        }
+    }
 
     Scaffold { padding ->
         Column(
@@ -65,13 +87,79 @@ private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text("RobGit — Diagnóstico JGit", style = MaterialTheme.typography.headlineSmall)
+            Text("RobGit", style = MaterialTheme.typography.headlineSmall)
+            Text("RobGit — Estado del repositorio", style = MaterialTheme.typography.headlineSmall)
+            Text("robdor80/Robgit.pruebas")
+            Text("Directorio: ${functionalRepository.absolutePath}")
+            if (repositoryPrepared == null) {
+                Text("Comprobando repositorio persistente…")
+            } else if (repositoryPrepared == false) {
+                Button(
+                    onClick = {
+                        runningOperation = "preparar repositorio"
+                        preparationResult = null
+                        repositoryState = null
+                        scope.launch {
+                            val completed = withContext(Dispatchers.IO) {
+                                repositoryStateService.prepare(functionalRepository)
+                            }
+                            preparationResult = completed
+                            repositoryPrepared = completed.success
+                            if (completed.success) {
+                                Log.i("RobGitState", completed.message)
+                            } else {
+                                Log.e("RobGitState", completed.error ?: completed.message)
+                            }
+                            runningOperation = null
+                        }
+                    },
+                    enabled = runningOperation == null,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(16.dp),
+                ) {
+                    Text("PREPARAR REPOSITORIO")
+                }
+            } else {
+                Button(
+                    onClick = {
+                        runningOperation = "actualizar estado"
+                        repositoryState = null
+                        scope.launch {
+                            val completed = withContext(Dispatchers.IO) {
+                                repositoryStateService.refreshState(functionalRepository)
+                            }
+                            repositoryState = completed
+                            if (completed.error == null) {
+                                Log.i("RobGitState", "${completed.type}: ${completed.message}")
+                            } else {
+                                Log.e("RobGitState", completed.error)
+                            }
+                            runningOperation = null
+                        }
+                    },
+                    enabled = runningOperation == null,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(16.dp),
+                ) {
+                    Text("ACTUALIZAR ESTADO")
+                }
+            }
+            if (runningOperation == "preparar repositorio" || runningOperation == "actualizar estado") {
+                Text("Consultando repositorio…")
+            }
+            preparationResult?.let { result ->
+                Text(if (result.success) "✓ ${result.message}" else "✗ ${result.message}")
+                result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+            repositoryState?.let { RepositoryStatePanel(it) }
+
+            Text("Herramientas de diagnóstico", style = MaterialTheme.typography.headlineSmall)
             Text("Prueba local", style = MaterialTheme.typography.titleLarge)
             Button(
                 onClick = {
                     runningOperation = "local"
                     localResult = null
-                    val directory = File(root, UUID.randomUUID().toString())
+                    val directory = File(diagnosticRoot, UUID.randomUUID().toString())
                     scope.launch {
                         try {
                             val completed = withContext(Dispatchers.IO) {
@@ -102,7 +190,7 @@ private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
                 onClick = {
                     runningOperation = "remoto"
                     remoteResult = null
-                    val directory = File(File(root, "remote-clones"), UUID.randomUUID().toString())
+                    val directory = File(File(diagnosticRoot, "remote-clones"), UUID.randomUUID().toString())
                     scope.launch {
                         try {
                             val completed = withContext(Dispatchers.IO) {
@@ -149,7 +237,7 @@ private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
                     token = ""
                     runningOperation = "push"
                     pushResult = null
-                    val directory = File(File(root, "authenticated-pushes"), UUID.randomUUID().toString())
+                    val directory = File(File(diagnosticRoot, "authenticated-pushes"), UUID.randomUUID().toString())
                     scope.launch {
                         try {
                             val completed = withContext(Dispatchers.IO) {
@@ -183,6 +271,42 @@ private fun DiagnosticScreen(root: File, service: GitRepositoryService) {
             }
             DiagnosticResultPanel(pushResult, runningOperation == "push")
         }
+    }
+}
+
+@Composable
+private fun RepositoryStatePanel(snapshot: RepositoryStateSnapshot) {
+    val title = when (snapshot.type) {
+        RepositoryStateType.SYNCHRONIZED -> "✅ Sincronizado"
+        RepositoryStateType.LOCAL_CHANGES -> "⬆ Cambios locales pendientes"
+        RepositoryStateType.LOCAL_AHEAD -> "⬆ Local adelantado"
+        RepositoryStateType.REMOTE_AHEAD -> "⬇ GitHub adelantado"
+        RepositoryStateType.DIVERGED -> "↕ Repositorio divergente"
+        RepositoryStateType.ERROR -> "⚠ Estado no determinable"
+    }
+    Text(title, style = MaterialTheme.typography.titleLarge)
+    Text(snapshot.message)
+    Text("Rama: ${snapshot.branch ?: "desconocida"}")
+    Text("HEAD local: ${snapshot.localHead?.take(7) ?: "desconocido"}")
+    Text("origin/main: ${snapshot.remoteHead?.take(7) ?: "desconocido"}")
+    Text("Ahead: ${snapshot.ahead} · Behind: ${snapshot.behind}")
+    if (snapshot.type == RepositoryStateType.LOCAL_CHANGES) {
+        Text("Relación de commits: ${snapshot.relation}")
+    }
+    StateFiles("Nuevos", snapshot.changes.newFiles)
+    StateFiles("Modificados", snapshot.changes.modifiedFiles)
+    StateFiles("Eliminados", snapshot.changes.deletedFiles)
+    StateFiles("Staged", snapshot.changes.stagedFiles)
+    StateFiles("En conflicto", snapshot.changes.conflictingFiles)
+    Text("Remoto actualizado: ${if (snapshot.remoteStateIsFresh) "sí" else "no"}")
+    Text("Última comprobación: ${snapshot.checkedAt}")
+    snapshot.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+}
+
+@Composable
+private fun StateFiles(label: String, files: Set<String>) {
+    if (files.isNotEmpty()) {
+        Text("$label (${files.size}): ${files.joinToString()}")
     }
 }
 

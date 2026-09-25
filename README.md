@@ -19,3 +19,9 @@ La APK queda en `app/build/outputs/apk/debug/app-debug.apk`.
 **PRUEBA PUSH AUTENTICADO** usa exclusivamente `robdor80/Robgit.pruebas`. El token se introduce en un campo oculto, permanece solo en memoria durante la operación y se elimina del estado de la interfaz al comenzar. La prueba clona, modifica únicamente `robgit_android_test.txt`, crea un commit local, hace `fetch` para comprobar que GitHub no haya avanzado, ejecuta un push normal y consulta `refs/heads/main` para confirmar el commit remoto. Ante un resultado de red dudoso, consulta el remoto una vez y no repite el push.
 
 Los tests JVM comprueban el contenido local dentro del commit, que la prueba no utilice una carpeta ya existente y que los errores autenticados oculten credenciales. Las operaciones remotas no se ejecutan en la suite JVM: deben probarse desde la app en la Galaxy Tab S9+.
+
+## Estado del repositorio funcional
+
+La sección **RobGit — Estado del repositorio** prepara una única copia persistente de `robdor80/Robgit.pruebas` en `filesDir/repos/robgit-pruebas`. Si la carpeta ya existe, la abre y nunca clona encima ni elimina su contenido.
+
+**ACTUALIZAR ESTADO** realiza primero un `fetch` y después calcula la relación real del grafo entre `HEAD` y `origin/main`: sincronizado, local adelantado, remoto adelantado o divergente, con el número de commits exclusivos de cada lado. El working tree se representa por separado mediante archivos nuevos, modificados, eliminados, staged y en conflicto. Si el fetch falla, el resultado es `ERROR` y nunca se presenta como sincronizado.
