@@ -39,3 +39,9 @@ La suite JVM incluye escenarios deterministas con remotos Git locales para un co
 Antes del push realiza un segundo `fetch` y bloquea la operación si GitHub cambió. El push se limita a `refs/heads/main:refs/heads/main`, con force desactivado. Un rechazo conserva todo el trabajo local. Si la respuesta del push es ambigua, realiza una única comprobación remota y nunca reintenta automáticamente.
 
 El PAT se mantiene únicamente en memoria, se muestra enmascarado y se limpia al comenzar y finalizar la operación. No se guarda en preferencias, archivos, URLs, logs ni mensajes de error. Los tests de SUBIR utilizan exclusivamente repositorios bare locales y cubren staging, commits existentes, carreras remotas, rechazos non-fast-forward, credenciales, fallos de fetch y respuestas ambiguas. El Hito 6 todavía requiere validación física en la Galaxy Tab S9+.
+
+## Sincronización segura
+
+**↕ SINCRONIZAR** es el flujo principal conservador. Siempre hace `fetch` y recalcula el estado real antes de decidir: si ya está sincronizado no actúa; si GitHub está adelantado y el árbol está limpio delega en DESCARGAR; si solo hay trabajo local delega en SUBIR. Cada ejecución realiza como máximo una de esas operaciones, nunca ambas.
+
+Si hay cambios en este dispositivo y en GitHub, divergencia, conflictos o fallo de fetch, se bloquea sin intentar merge, rebase, reset ni resolución automática. El PAT solo se exige cuando la decisión requiere SUBIR. La validación física de SINCRONIZAR queda pendiente. También permanece pendiente el refresco visual del resultado tras rotar la Activity.

@@ -67,6 +67,7 @@ private fun DiagnosticScreen(
     var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
     var downloadResult by remember { mutableStateOf<DownloadResult?>(null) }
     var uploadResult by remember { mutableStateOf<UploadResult?>(null) }
+    var synchronizationResult by remember { mutableStateOf<SynchronizationResult?>(null) }
     var commitMessage by remember { mutableStateOf("Cambios desde RobGit") }
     var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
@@ -104,6 +105,7 @@ private fun DiagnosticScreen(
                         repositoryState = null
                         downloadResult = null
                         uploadResult = null
+                        synchronizationResult = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -134,6 +136,7 @@ private fun DiagnosticScreen(
                         repositoryState = null
                         downloadResult = null
                         uploadResult = null
+                        synchronizationResult = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -160,7 +163,8 @@ private fun DiagnosticScreen(
             if (runningOperation == "preparar repositorio" ||
                 runningOperation == "actualizar estado" ||
                 runningOperation == "descargar" ||
-                runningOperation == "subir"
+                runningOperation == "subir" ||
+                runningOperation == "sincronizar"
             ) {
                 Text("Consultando repositorio…")
             }
@@ -191,6 +195,49 @@ private fun DiagnosticScreen(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Button(
+                    onClick = {
+                        val tokenForRun = token.toCharArray()
+                        token = ""
+                        runningOperation = "sincronizar"
+                        synchronizationResult = null
+                        downloadResult = null
+                        uploadResult = null
+                        scope.launch {
+                            try {
+                                val completed = withContext(Dispatchers.IO) {
+                                    repositoryStateService.synchronizeSafely(
+                                        functionalRepository,
+                                        tokenForRun,
+                                        commitMessage,
+                                    )
+                                }
+                                synchronizationResult = completed
+                                completed.finalState?.let { repositoryState = it }
+                                if (completed.outcome == SynchronizationOutcome.SUCCESS_DOWNLOADED ||
+                                    completed.outcome == SynchronizationOutcome.SUCCESS_UPLOADED ||
+                                    completed.outcome == SynchronizationOutcome.NOTHING_TO_DO
+                                ) {
+                                    Log.i("RobGitState", "${completed.outcome}: ${completed.message}")
+                                } else {
+                                    Log.w(
+                                        "RobGitState",
+                                        "${completed.outcome}: ${completed.error ?: completed.message}",
+                                    )
+                                }
+                            } finally {
+                                tokenForRun.fill('\u0000')
+                                token = ""
+                                runningOperation = null
+                            }
+                        }
+                    },
+                    enabled = runningOperation == null,
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(20.dp),
+                ) {
+                    Text("↕ SINCRONIZAR")
+                }
                 val canDownload = repositoryState?.let { state ->
                     state.type == RepositoryStateType.REMOTE_AHEAD &&
                         state.relation == CommitRelation.REMOTE_AHEAD &&
@@ -204,6 +251,7 @@ private fun DiagnosticScreen(
                         runningOperation = "descargar"
                         downloadResult = null
                         uploadResult = null
+                        synchronizationResult = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -245,6 +293,7 @@ private fun DiagnosticScreen(
                         runningOperation = "subir"
                         uploadResult = null
                         downloadResult = null
+                        synchronizationResult = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -283,6 +332,7 @@ private fun DiagnosticScreen(
             }
             DownloadResultPanel(downloadResult)
             UploadResultPanel(uploadResult)
+            SynchronizationResultPanel(synchronizationResult)
 
             Text("Herramientas de diagnóstico", style = MaterialTheme.typography.headlineSmall)
             Text("Prueba local", style = MaterialTheme.typography.titleLarge)
@@ -473,6 +523,24 @@ private fun UploadResultPanel(result: UploadResult?) {
     }
     if (result.outcome == UploadOutcome.SUCCESS) {
         Text("Commits subidos: ${result.commitsUploaded}")
+    }
+    result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+}
+
+@Composable
+private fun SynchronizationResultPanel(result: SynchronizationResult?) {
+    result ?: return
+    val prefix = when (result.outcome) {
+        SynchronizationOutcome.SUCCESS_DOWNLOADED,
+        SynchronizationOutcome.SUCCESS_UPLOADED,
+        -> "✓"
+        SynchronizationOutcome.NOTHING_TO_DO -> "="
+        else -> "⚠"
+    }
+    Text("$prefix ${result.message}")
+    Text("Resultado: ${result.outcome}")
+    result.finalState?.let { state ->
+        Text("Ahead: ${state.ahead} · Behind: ${state.behind}")
     }
     result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
 }

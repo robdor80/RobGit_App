@@ -116,6 +116,30 @@ data class UploadResult(
     val error: String? = null,
 )
 
+enum class SynchronizationOutcome {
+    SUCCESS_DOWNLOADED,
+    SUCCESS_UPLOADED,
+    NOTHING_TO_DO,
+    BLOCKED_CHANGES_ON_BOTH_SIDES,
+    BLOCKED_DIVERGED,
+    BLOCKED_CONFLICTS,
+    AUTH_REQUIRED,
+    AUTH_FAILED,
+    FETCH_ERROR,
+    PUSH_REJECTED_REMOTE_CHANGED,
+    PUSH_UNCERTAIN,
+    ERROR,
+}
+
+data class SynchronizationResult(
+    val outcome: SynchronizationOutcome,
+    val message: String,
+    val finalState: RepositoryStateSnapshot?,
+    val downloadResult: DownloadResult? = null,
+    val uploadResult: UploadResult? = null,
+    val error: String? = null,
+)
+
 /** Prepares and reads the single persistent functional repository used at this stage. */
 class RepositoryStateService(
     private val repositoryUrl: String = FUNCTIONAL_REPOSITORY_URL,
@@ -622,6 +646,155 @@ class RepositoryStateService(
             Arrays.fill(token, '\u0000')
         }
     }
+
+    /** Chooses at most one already-validated operation: no action, fast-forward download, or upload. */
+    fun synchronizeSafely(
+        repositoryDirectory: File,
+        token: CharArray,
+        commitMessage: String,
+    ): SynchronizationResult {
+        try {
+            val conflictCheck = readLocalConflicts(repositoryDirectory)
+            if (conflictCheck.hasConflicts) {
+                return SynchronizationResult(
+                    outcome = SynchronizationOutcome.BLOCKED_CONFLICTS,
+                    message = "Hay conflictos Git existentes. RobGit no realizará ninguna operación automática.",
+                    finalState = conflictCheck.state,
+                )
+            }
+            if (conflictCheck.error != null) {
+                return SynchronizationResult(
+                    outcome = SynchronizationOutcome.ERROR,
+                    message = "No se ha podido abrir el repositorio con seguridad.",
+                    finalState = null,
+                    error = conflictCheck.error,
+                )
+            }
+
+            // refreshState performs the mandatory initial fetch and graph recalculation.
+            val state = refreshState(repositoryDirectory)
+            if (state.type == RepositoryStateType.ERROR) {
+                return SynchronizationResult(
+                    outcome = if (state.remoteStateIsFresh) {
+                        SynchronizationOutcome.ERROR
+                    } else {
+                        SynchronizationOutcome.FETCH_ERROR
+                    },
+                    message = state.message,
+                    finalState = state,
+                    error = state.error,
+                )
+            }
+
+            return when (state.relation) {
+                CommitRelation.SYNCHRONIZED -> {
+                    if (state.changes.hasChanges) {
+                        mapUploadForSynchronization(
+                            uploadSafely(repositoryDirectory, token, commitMessage),
+                        )
+                    } else {
+                        SynchronizationResult(
+                            outcome = SynchronizationOutcome.NOTHING_TO_DO,
+                            message = "Ya está sincronizado.",
+                            finalState = state,
+                        )
+                    }
+                }
+                CommitRelation.REMOTE_AHEAD -> {
+                    if (state.changes.hasChanges) {
+                        SynchronizationResult(
+                            outcome = SynchronizationOutcome.BLOCKED_CHANGES_ON_BOTH_SIDES,
+                            message = "Hay cambios tanto en este dispositivo como en GitHub. " +
+                                "RobGit no realizará ninguna operación automática.",
+                            finalState = state,
+                        )
+                    } else {
+                        mapDownloadForSynchronization(downloadFastForward(repositoryDirectory))
+                    }
+                }
+                CommitRelation.LOCAL_AHEAD -> mapUploadForSynchronization(
+                    uploadSafely(repositoryDirectory, token, commitMessage),
+                )
+                CommitRelation.DIVERGED -> SynchronizationResult(
+                    outcome = SynchronizationOutcome.BLOCKED_DIVERGED,
+                    message = "El repositorio local y GitHub han divergido. " +
+                        "RobGit no realizará ninguna operación automática.",
+                    finalState = state,
+                )
+                CommitRelation.UNDETERMINED -> SynchronizationResult(
+                    outcome = SynchronizationOutcome.ERROR,
+                    message = "No se puede determinar con seguridad la relación con GitHub.",
+                    finalState = state,
+                    error = state.error,
+                )
+            }
+        } finally {
+            // uploadSafely also clears it; double clearing is intentional and harmless.
+            Arrays.fill(token, '\u0000')
+        }
+    }
+
+    private fun mapDownloadForSynchronization(download: DownloadResult): SynchronizationResult =
+        SynchronizationResult(
+            outcome = when (download.outcome) {
+                DownloadOutcome.SUCCESS -> SynchronizationOutcome.SUCCESS_DOWNLOADED
+                DownloadOutcome.ALREADY_SYNCHRONIZED -> SynchronizationOutcome.NOTHING_TO_DO
+                DownloadOutcome.FETCH_ERROR -> SynchronizationOutcome.FETCH_ERROR
+                DownloadOutcome.DIVERGED -> SynchronizationOutcome.BLOCKED_DIVERGED
+                DownloadOutcome.BLOCKED_LOCAL_CHANGES -> {
+                    SynchronizationOutcome.BLOCKED_CHANGES_ON_BOTH_SIDES
+                }
+                else -> SynchronizationOutcome.ERROR
+            },
+            message = download.message,
+            finalState = download.finalState,
+            downloadResult = download,
+            error = download.error,
+        )
+
+    private fun mapUploadForSynchronization(upload: UploadResult): SynchronizationResult =
+        SynchronizationResult(
+            outcome = when (upload.outcome) {
+                UploadOutcome.SUCCESS -> SynchronizationOutcome.SUCCESS_UPLOADED
+                UploadOutcome.NOTHING_TO_UPLOAD -> SynchronizationOutcome.NOTHING_TO_DO
+                UploadOutcome.AUTH_REQUIRED -> SynchronizationOutcome.AUTH_REQUIRED
+                UploadOutcome.AUTH_FAILED -> SynchronizationOutcome.AUTH_FAILED
+                UploadOutcome.FETCH_ERROR -> SynchronizationOutcome.FETCH_ERROR
+                UploadOutcome.PUSH_REJECTED_REMOTE_CHANGED -> {
+                    SynchronizationOutcome.PUSH_REJECTED_REMOTE_CHANGED
+                }
+                UploadOutcome.PUSH_UNCERTAIN -> SynchronizationOutcome.PUSH_UNCERTAIN
+                UploadOutcome.BLOCKED_DIVERGED -> SynchronizationOutcome.BLOCKED_DIVERGED
+                UploadOutcome.BLOCKED_CONFLICTS -> SynchronizationOutcome.BLOCKED_CONFLICTS
+                UploadOutcome.BLOCKED_REMOTE_AHEAD,
+                UploadOutcome.ERROR,
+                -> SynchronizationOutcome.ERROR
+            },
+            message = upload.message,
+            finalState = upload.finalState,
+            uploadResult = upload,
+            error = upload.error,
+        )
+
+    private fun readLocalConflicts(repositoryDirectory: File): LocalConflictCheck = try {
+        check(File(repositoryDirectory, ".git").isDirectory) {
+            "El repositorio persistente todavía no está preparado."
+        }
+        Git.open(repositoryDirectory).use { git ->
+            validateRepositoryIdentity(git)
+            val hasConflicts = git.status().call().conflicting.isNotEmpty()
+            LocalConflictCheck(hasConflicts = hasConflicts)
+        }
+    } catch (failure: Throwable) {
+        if (failure !is Exception && failure !is LinkageError) throw failure
+        LocalConflictCheck(error = safeFailure("Apertura del repositorio", failure))
+    }
+
+    private data class LocalConflictCheck(
+        val hasConflicts: Boolean = false,
+        val state: RepositoryStateSnapshot? = null,
+        val error: String? = null,
+    )
 
     private fun stageAllRelevantChanges(git: Git) {
         git.add().addFilepattern(".").call()
