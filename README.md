@@ -1,4 +1,12 @@
-# RobGit — spike JGit en Android
+# RobGit — Git seguro con una interfaz humana
+
+La pantalla principal de RobGit presenta el estado del repositorio en castellano claro, sin exponer HEAD, refs, ahead/behind ni otros conceptos técnicos. Utiliza una identidad propia azul petróleo y blanco hielo, ofrece PULL, PUSH y SINCRONIZAR mediante el motor seguro existente y analiza automáticamente al abrir la app, al volver realmente desde segundo plano y después de cada operación. La rotación conserva el estado y no provoca una consulta remota nueva.
+
+El menú superior reúne el análisis manual, los detalles técnicos y los ajustes de diagnóstico. El PAT y el mensaje de cambio solo aparecen cuando una subida los necesita; el token vive exclusivamente en memoria. La interfaz del Asistente RobGit ya permite escoger una orden y escribir una pregunta, pero **la IA todavía no está conectada** y no realiza ninguna llamada de red.
+
+## Diseño adaptable
+
+En móviles la aplicación funciona solo en vertical. Las tablets admiten vertical y horizontal; en apaisado, el selector y el estado ocupan la zona izquierda y la cuadrícula de acciones la derecha, con un ancho máximo para evitar controles sobredimensionados.
 
 Este proyecto valida en Android operaciones Git seguras mediante Eclipse JGit 7.8. Conserva los spikes de diagnóstico local, clone HTTPS y push autenticado, y utiliza una copia persistente de `robdor80/Robgit.pruebas` para las funciones de estado, descarga y subida.
 

@@ -1,36 +1,48 @@
 package es.robertodorado.robgit
 
+import android.content.pm.ActivityInfo
 import android.os.Bundle
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.PaddingValues
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.padding
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
-import androidx.compose.material3.Button
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -38,667 +50,440 @@ import java.io.File
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
+    private val foregroundPolicy = ForegroundRefreshPolicy()
+    private var foregroundReturn by mutableIntStateOf(0)
+
     override fun onCreate(savedInstanceState: Bundle?) {
+        val tablet = resources.configuration.smallestScreenWidthDp >= 600
+        requestedOrientation = if (tablet) ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         super.onCreate(savedInstanceState)
         val diagnosticRoot = File(filesDir, "diagnostics")
-        val service = GitRepositoryService()
-        val repositoryStateService = RepositoryStateService()
         val functionalRepository = File(filesDir, "repos/robgit-pruebas")
         setContent {
-            MaterialTheme {
-                DiagnosticScreen(
-                    diagnosticRoot = diagnosticRoot,
-                    service = service,
-                    repositoryStateService = repositoryStateService,
-                    functionalRepository = functionalRepository,
+            RobGitTheme {
+                RobGitScreen(
+                    diagnosticRoot, remember { GitRepositoryService() }, remember { RepositoryStateService() },
+                    functionalRepository, foregroundReturn,
                 )
             }
         }
     }
+
+    override fun onStart() {
+        super.onStart()
+        if (foregroundPolicy.onStart()) foregroundReturn++
+    }
+
+    override fun onStop() {
+        foregroundPolicy.onStop(isChangingConfigurations)
+        super.onStop()
+    }
 }
 
+private enum class AuthPurpose { PUSH, SYNCHRONIZE, DIAGNOSTIC }
+
 @Composable
-private fun DiagnosticScreen(
+private fun RobGitScreen(
     diagnosticRoot: File,
-    service: GitRepositoryService,
-    repositoryStateService: RepositoryStateService,
+    gitService: GitRepositoryService,
+    repositoryService: RepositoryStateService,
     functionalRepository: File,
+    foregroundReturn: Int,
 ) {
     var repositoryPrepared by rememberSaveable { mutableStateOf<Boolean?>(null) }
-    var preparationResult by remember { mutableStateOf<RepositoryPreparationResult?>(null) }
-    var repositoryState by rememberSaveable(stateSaver = repositoryStateSaver) {
-        mutableStateOf<RepositoryStateSnapshot?>(null)
-    }
-    var downloadResult by remember { mutableStateOf<DownloadResult?>(null) }
-    var uploadResult by remember { mutableStateOf<UploadResult?>(null) }
-    var synchronizationResult by remember { mutableStateOf<SynchronizationResult?>(null) }
-    var lastOperation by rememberSaveable(stateSaver = lastOperationSaver) {
-        mutableStateOf<RestoredOperation?>(null)
-    }
-    var commitMessage by rememberSaveable { mutableStateOf("Cambios desde RobGit") }
-    var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
-    var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
-    var pushResult by remember { mutableStateOf<DiagnosticResult?>(null) }
-    var token by remember { mutableStateOf("") }
+    var repositoryState by rememberSaveable(stateSaver = repositoryStateSaver) { mutableStateOf<RepositoryStateSnapshot?>(null) }
+    var lastOperation by rememberSaveable(stateSaver = lastOperationSaver) { mutableStateOf<RestoredOperation?>(null) }
+    var noticeTitle by rememberSaveable { mutableStateOf<String?>(null) }
+    var noticeBody by rememberSaveable { mutableStateOf<String?>(null) }
+    var noticeRecommendation by rememberSaveable { mutableStateOf<String?>(null) }
     var runningOperation by remember { mutableStateOf<String?>(null) }
+    var showTechnical by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var showAi by remember { mutableStateOf(false) }
+    var authPurpose by remember { mutableStateOf<AuthPurpose?>(null) }
+    var localDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
+    var remoteDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
+    var pushDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
     val scope = rememberCoroutineScope()
 
+    fun clearNotice() { noticeTitle = null; noticeBody = null; noticeRecommendation = null }
+    fun setNotice(title: String, body: String, recommendation: String? = null) {
+        noticeTitle = title; noticeBody = body; noticeRecommendation = recommendation
+    }
+    fun analyze() {
+        if (runningOperation != null || repositoryPrepared != true) return
+        runningOperation = "analizando"; clearNotice()
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { repositoryService.refreshState(functionalRepository) }
+                repositoryState = result
+                lastOperation = RestoredOperation("ANALIZAR AHORA", result.type.name, result.message, result.error)
+            } finally { runningOperation = null }
+        }
+    }
+    fun prepareRepository() {
+        if (runningOperation != null) return
+        runningOperation = "preparando"; clearNotice()
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { repositoryService.prepare(functionalRepository) }
+                repositoryPrepared = result.success
+                lastOperation = RestoredOperation("PREPARAR REPOSITORIO", if (result.success) "OK" else "ERROR", result.message, result.error)
+                if (result.success) repositoryState = withContext(Dispatchers.IO) { repositoryService.refreshState(functionalRepository) }
+                else setNotice("No se ha podido preparar el repositorio.", "Tus archivos están protegidos.")
+            } finally { runningOperation = null }
+        }
+    }
+    fun pull() {
+        if (runningOperation != null) return
+        runningOperation = "PULL"; clearNotice()
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { repositoryService.downloadFastForward(functionalRepository) }
+                result.finalState?.let { repositoryState = it }
+                lastOperation = RestoredOperation("PULL", result.outcome.name, result.message, result.error)
+                RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
+            } finally { runningOperation = null }
+        }
+    }
+    fun upload(token: CharArray, commitMessage: String) {
+        runningOperation = "PUSH"; clearNotice()
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { repositoryService.uploadSafely(functionalRepository, token, commitMessage) }
+                result.finalState?.let { repositoryState = it }
+                lastOperation = RestoredOperation("PUSH", result.outcome.name, result.message, result.error)
+                RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
+                if (result.outcome == UploadOutcome.AUTH_REQUIRED) authPurpose = AuthPurpose.PUSH
+            } finally { token.fill('\u0000'); runningOperation = null }
+        }
+    }
+    fun synchronize(token: CharArray = charArrayOf(), commitMessage: String = "Cambios desde RobGit") {
+        runningOperation = "SINCRONIZAR"; clearNotice()
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) { repositoryService.synchronizeSafely(functionalRepository, token, commitMessage) }
+                result.finalState?.let { repositoryState = it }
+                lastOperation = RestoredOperation("SINCRONIZAR", result.outcome.name, result.message, result.error)
+                RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
+                if (result.outcome == SynchronizationOutcome.AUTH_REQUIRED) authPurpose = AuthPurpose.SYNCHRONIZE
+            } finally { token.fill('\u0000'); runningOperation = null }
+        }
+    }
+
     LaunchedEffect(functionalRepository.absolutePath) {
-        repositoryPrepared = withContext(Dispatchers.IO) {
-            repositoryStateService.isPrepared(functionalRepository)
+        if (repositoryPrepared == null) {
+            val prepared = withContext(Dispatchers.IO) { repositoryService.isPrepared(functionalRepository) }
+            repositoryPrepared = prepared
+            if (prepared) {
+                runningOperation = "analizando"
+                try { repositoryState = withContext(Dispatchers.IO) { repositoryService.refreshState(functionalRepository) } }
+                finally { runningOperation = null }
+            }
+        }
+    }
+    LaunchedEffect(foregroundReturn) { if (foregroundReturn > 0 && repositoryPrepared == true) analyze() }
+
+    val baseStatus = when {
+        repositoryPrepared == false -> RepositoryStatusPresenter.notPrepared
+        repositoryState != null -> RepositoryStatusPresenter.present(requireNotNull(repositoryState))
+        else -> RepositoryStatusPresenter.analyzing
+    }
+    val displayedStatus = when {
+        runningOperation == "analizando" -> RepositoryStatusPresenter.analyzing
+        noticeTitle != null -> RepositoryHumanStatus(requireNotNull(noticeTitle), noticeBody.orEmpty(), noticeRecommendation)
+        else -> baseStatus
+    }
+
+    Surface(color = RobGitColors.Petroleum, modifier = Modifier.fillMaxSize()) {
+        BoxWithConstraints(Modifier.fillMaxSize()) {
+            val tablet = LocalConfiguration.current.smallestScreenWidthDp >= 600
+            val landscapeTablet = tablet && maxWidth > maxHeight
+            val outerPadding = if (tablet) RobGitDimens.TabletPadding else RobGitDimens.PhonePadding
+            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(outerPadding), horizontalAlignment = Alignment.CenterHorizontally) {
+                Column(Modifier.fillMaxWidth().widthIn(max = RobGitDimens.ContentMax)) {
+                    RobGitHeader(::analyze, { showTechnical = true }, { showSettings = true })
+                    Spacer(Modifier.height(18.dp))
+                    if (landscapeTablet) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(28.dp), modifier = Modifier.fillMaxWidth()) {
+                            Column(Modifier.weight(1.15f)) {
+                                RepositorySelector(); Spacer(Modifier.height(22.dp))
+                                HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, ::prepareRepository)
+                            }
+                            ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, ::pull,
+                                { authPurpose = AuthPurpose.PUSH },
+                                { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
+                                { showAi = true }, Modifier.weight(.85f))
+                        }
+                    } else {
+                        RepositorySelector(); Spacer(Modifier.height(22.dp))
+                        HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, ::prepareRepository)
+                        Spacer(Modifier.height(if (tablet) 28.dp else 22.dp))
+                        ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, ::pull,
+                            { authPurpose = AuthPurpose.PUSH },
+                            { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
+                            { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp))
+                    }
+                }
+            }
         }
     }
 
-    Scaffold { padding ->
+    if (showTechnical) TechnicalDetailsDialog(repositoryState, lastOperation) { showTechnical = false }
+    if (showAi) AiAssistantDialog { showAi = false }
+    if (showSettings) SettingsDialog(runningOperation, localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
+        {
+            runningOperation = "diagnóstico local"; scope.launch {
+                localDiagnostic = withContext(Dispatchers.IO) { gitService.runLocalDiagnostic(File(diagnosticRoot, UUID.randomUUID().toString())) }
+                runningOperation = null
+            }
+        }, {
+            runningOperation = "diagnóstico clone"; scope.launch {
+                remoteDiagnostic = withContext(Dispatchers.IO) { gitService.runRemoteCloneDiagnostic(File(diagnosticRoot, "remote-clones/${UUID.randomUUID()}")) }
+                runningOperation = null
+            }
+        }, { authPurpose = AuthPurpose.DIAGNOSTIC })
+    authPurpose?.let { purpose ->
+        AuthenticationDialog(purpose, { authPurpose = null }) { token, message ->
+            authPurpose = null
+            when (purpose) {
+                AuthPurpose.PUSH -> upload(token, message)
+                AuthPurpose.SYNCHRONIZE -> synchronize(token, message)
+                AuthPurpose.DIAGNOSTIC -> {
+                    runningOperation = "diagnóstico push"; scope.launch {
+                        try {
+                            pushDiagnostic = withContext(Dispatchers.IO) {
+                                gitService.runAuthenticatedPushDiagnostic(File(diagnosticRoot, "authenticated-push/${UUID.randomUUID()}"), token)
+                            }
+                        } finally { token.fill('\u0000'); runningOperation = null }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RobGitHeader(onAnalyze: () -> Unit, onTechnical: () -> Unit, onSettings: () -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+        Image(painterResource(R.drawable.ic_robgit_logo), "Icono de RobGit", contentScale = ContentScale.Fit, modifier = Modifier.size(42.dp))
+        Spacer(Modifier.width(12.dp)); Text("RobGit", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
+        Box {
+            Text("⋮", fontSize = 30.sp, textAlign = TextAlign.Center, modifier = Modifier.size(48.dp).semantics { contentDescription = "Abrir menú" }.clickable { open = true })
+            DropdownMenu(open, { open = false }) {
+                DropdownMenuItem({ Text("ANALIZAR AHORA") }, { open = false; onAnalyze() })
+                DropdownMenuItem({ Text("DETALLES TÉCNICOS") }, { open = false; onTechnical() })
+                DropdownMenuItem({ Text("AJUSTES") }, { open = false; onSettings() })
+            }
+        }
+    }
+}
+
+@Composable
+private fun RepositorySelector() {
+    var open by remember { mutableStateOf(false) }
+    Box {
+        TitledFrame(title = "REPOSITORIO", modifier = Modifier.fillMaxWidth()) {
+            Box {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { open = true }.padding(horizontal = 18.dp, vertical = 15.dp)) {
+                    Text("Robgit.pruebas", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Text("▾", fontSize = 22.sp)
+                }
+                DropdownMenu(open, { open = false }) { DropdownMenuItem({ Text("Robgit.pruebas") }, { open = false }) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, notPrepared: Boolean, onPrepare: () -> Unit) {
+    TitledFrame(title = "ESTADO DEL REPOSITORIO", modifier = Modifier.fillMaxWidth(), contentColor = RobGitColors.PetroleumDark.copy(alpha = .48f)) {
+        Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 20.dp)) {
+            AnimatedContent(status.title, label = "estado") { Text(it, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
+            Spacer(Modifier.height(12.dp)); Text(status.explanation, color = RobGitColors.IceMuted, style = MaterialTheme.typography.bodyLarge)
+            status.recommendation?.let { Spacer(Modifier.height(14.dp)); Text(it, color = if (status.blocked) RobGitColors.Warning else RobGitColors.Success, fontWeight = FontWeight.SemiBold) }
+            if (running) { Spacer(Modifier.height(18.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = RobGitColors.Ice); Spacer(Modifier.width(12.dp)); Text("RobGit está trabajando…") } }
+            if (notPrepared) { Spacer(Modifier.height(18.dp)); OutlinedButton(onPrepare, modifier = Modifier.fillMaxWidth()) { Text("PREPARAR REPOSITORIO") } }
+        }
+    }
+}
+
+/** Rounded frame whose top stroke is drawn in two pieces around its integrated title. */
+@Composable
+private fun TitledFrame(
+    title: String,
+    modifier: Modifier = Modifier,
+    contentColor: Color? = null,
+    content: @Composable () -> Unit,
+) {
+    val titleStyle = MaterialTheme.typography.labelLarge
+    val titleLayout = androidx.compose.ui.text.rememberTextMeasurer().measure(
+        androidx.compose.ui.text.AnnotatedString(title),
+        style = titleStyle.copy(fontWeight = FontWeight.Bold),
+    )
+    val shape = RoundedCornerShape(RobGitDimens.Radius)
+    val titleStart = RobGitDimens.Radius + 24.dp
+    Box(modifier.padding(top = 10.dp)) {
         Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .verticalScroll(rememberScrollState())
-                .padding(20.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+            Modifier.fillMaxWidth()
+                .padding(top = 22.dp)
+                .then(if (contentColor != null) Modifier.background(contentColor, shape) else Modifier),
         ) {
-            Text("RobGit", style = MaterialTheme.typography.headlineSmall)
-            Text("RobGit — Estado del repositorio", style = MaterialTheme.typography.headlineSmall)
-            Text("robdor80/Robgit.pruebas")
-            Text("Directorio: ${functionalRepository.absolutePath}")
-            if (repositoryPrepared == null) {
-                Text("Comprobando repositorio persistente…")
-            } else if (repositoryPrepared == false) {
-                Button(
-                    onClick = {
-                        runningOperation = "preparar repositorio"
-                        preparationResult = null
-                        repositoryState = null
-                        downloadResult = null
-                        uploadResult = null
-                        synchronizationResult = null
-                        lastOperation = null
-                        scope.launch {
-                            try {
-                                val completed = withContext(Dispatchers.IO) {
-                                    repositoryStateService.prepare(functionalRepository)
-                                }
-                                preparationResult = completed
-                                repositoryPrepared = completed.success
-                                lastOperation = RestoredOperation(
-                                    operation = "PREPARAR REPOSITORIO",
-                                    outcome = if (completed.success) "OK" else "ERROR",
-                                    message = completed.message,
-                                    detail = completed.error,
-                                )
-                                if (completed.success) {
-                                    Log.i("RobGitState", completed.message)
-                                } else {
-                                    Log.e("RobGitState", completed.error ?: completed.message)
-                                }
-                            } finally {
-                                runningOperation = null
-                            }
-                        }
-                    },
-                    enabled = runningOperation == null,
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(16.dp),
-                ) {
-                    Text("PREPARAR REPOSITORIO")
-                }
-            } else {
-                Button(
-                    onClick = {
-                        runningOperation = "actualizar estado"
-                        repositoryState = null
-                        downloadResult = null
-                        uploadResult = null
-                        synchronizationResult = null
-                        lastOperation = null
-                        scope.launch {
-                            try {
-                                val completed = withContext(Dispatchers.IO) {
-                                    repositoryStateService.refreshState(functionalRepository)
-                                }
-                                repositoryState = completed
-                                lastOperation = RestoredOperation(
-                                    operation = "ACTUALIZAR ESTADO",
-                                    outcome = completed.type.name,
-                                    message = completed.message,
-                                    detail = completed.error,
-                                )
-                                if (completed.error == null) {
-                                    Log.i("RobGitState", "${completed.type}: ${completed.message}")
-                                } else {
-                                    Log.e("RobGitState", completed.error)
-                                }
-                            } finally {
-                                runningOperation = null
-                            }
-                        }
-                    },
-                    enabled = runningOperation == null,
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(16.dp),
-                ) {
-                    Text("ACTUALIZAR ESTADO")
-                }
+            content()
+        }
+        Canvas(Modifier.matchParentSize()) {
+            val stroke = RobGitDimens.Border.toPx()
+            val radius = RobGitDimens.Radius.toPx()
+            val inset = stroke / 2f
+            val top = titleLayout.size.height / 2f
+            val gapStart = titleStart.toPx() - 8.dp.toPx()
+            val gapEnd = titleStart.toPx() + titleLayout.size.width + 8.dp.toPx()
+            val width = size.width
+            val height = size.height
+            val path = Path().apply {
+                moveTo(inset + radius, top)
+                lineTo(gapStart, top)
+                moveTo(gapEnd, top)
+                lineTo(width - inset - radius, top)
+                arcTo(Rect(width - inset - 2 * radius, top, width - inset, top + 2 * radius), 270f, 90f, false)
+                lineTo(width - inset, height - inset - radius)
+                arcTo(Rect(width - inset - 2 * radius, height - inset - 2 * radius, width - inset, height - inset), 0f, 90f, false)
+                lineTo(inset + radius, height - inset)
+                arcTo(Rect(inset, height - inset - 2 * radius, inset + 2 * radius, height - inset), 90f, 90f, false)
+                lineTo(inset, top + radius)
+                arcTo(Rect(inset, top, inset + 2 * radius, top + 2 * radius), 180f, 90f, false)
             }
-            if (runningOperation == "preparar repositorio" ||
-                runningOperation == "actualizar estado" ||
-                runningOperation == "descargar" ||
-                runningOperation == "subir" ||
-                runningOperation == "sincronizar"
-            ) {
-                Text("Consultando repositorio…")
-            }
-            preparationResult?.let { result ->
-                Text(if (result.success) "✓ ${result.message}" else "✗ ${result.message}")
-                result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-            }
-            repositoryState?.let { RepositoryStatePanel(it) }
-            if (repositoryPrepared == true) {
-                OutlinedTextField(
-                    value = commitMessage,
-                    onValueChange = { commitMessage = it },
-                    label = { Text("Mensaje del cambio") },
-                    enabled = runningOperation == null,
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = token,
-                    onValueChange = { token = it },
-                    label = { Text("Token GitHub") },
-                    visualTransformation = PasswordVisualTransformation(),
-                    keyboardOptions = KeyboardOptions(
-                        keyboardType = KeyboardType.Password,
-                        autoCorrectEnabled = false,
-                    ),
-                    enabled = runningOperation == null,
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                Button(
-                    onClick = {
-                        val tokenForRun = token.toCharArray()
-                        token = ""
-                        runningOperation = "sincronizar"
-                        synchronizationResult = null
-                        downloadResult = null
-                        uploadResult = null
-                        lastOperation = null
-                        scope.launch {
-                            try {
-                                val completed = withContext(Dispatchers.IO) {
-                                    repositoryStateService.synchronizeSafely(
-                                        functionalRepository,
-                                        tokenForRun,
-                                        commitMessage,
-                                    )
-                                }
-                                synchronizationResult = completed
-                                lastOperation = RestoredOperation(
-                                    operation = "↕ SINCRONIZAR",
-                                    outcome = completed.outcome.name,
-                                    message = completed.message,
-                                    detail = completed.error,
-                                )
-                                completed.finalState?.let { repositoryState = it }
-                                if (completed.outcome == SynchronizationOutcome.SUCCESS_DOWNLOADED ||
-                                    completed.outcome == SynchronizationOutcome.SUCCESS_UPLOADED ||
-                                    completed.outcome == SynchronizationOutcome.NOTHING_TO_DO
-                                ) {
-                                    Log.i("RobGitState", "${completed.outcome}: ${completed.message}")
-                                } else {
-                                    Log.w(
-                                        "RobGitState",
-                                        "${completed.outcome}: ${completed.error ?: completed.message}",
-                                    )
-                                }
-                            } finally {
-                                tokenForRun.fill('\u0000')
-                                token = ""
-                                runningOperation = null
-                            }
-                        }
-                    },
-                    enabled = runningOperation == null,
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(20.dp),
-                ) {
-                    Text("↕ SINCRONIZAR")
-                }
-                val canDownload = repositoryState?.let { state ->
-                    state.type == RepositoryStateType.REMOTE_AHEAD &&
-                        state.relation == CommitRelation.REMOTE_AHEAD &&
-                        state.remoteStateIsFresh &&
-                        !state.changes.hasChanges &&
-                        state.ahead == 0 &&
-                        state.behind > 0
-                } == true
-                Button(
-                    onClick = {
-                        runningOperation = "descargar"
-                        downloadResult = null
-                        uploadResult = null
-                        synchronizationResult = null
-                        lastOperation = null
-                        scope.launch {
-                            try {
-                                val completed = withContext(Dispatchers.IO) {
-                                    repositoryStateService.downloadFastForward(functionalRepository)
-                                }
-                                downloadResult = completed
-                                lastOperation = RestoredOperation(
-                                    operation = "↓ DESCARGAR",
-                                    outcome = completed.outcome.name,
-                                    message = completed.message,
-                                    detail = completed.error,
-                                )
-                                completed.finalState?.let { repositoryState = it }
-                                if (completed.outcome == DownloadOutcome.SUCCESS ||
-                                    completed.outcome == DownloadOutcome.ALREADY_SYNCHRONIZED
-                                ) {
-                                    Log.i("RobGitState", "${completed.outcome}: ${completed.message}")
-                                } else {
-                                    Log.w(
-                                        "RobGitState",
-                                        "${completed.outcome}: ${completed.error ?: completed.message}",
-                                    )
-                                }
-                            } finally {
-                                runningOperation = null
-                            }
-                        }
-                    },
-                    enabled = runningOperation == null && canDownload,
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(16.dp),
-                ) {
-                    Text("↓ DESCARGAR")
-                }
-                val canUpload = repositoryState?.let { state ->
-                    state.remoteStateIsFresh &&
-                        state.changes.conflictingFiles.isEmpty() &&
-                        (state.relation == CommitRelation.SYNCHRONIZED ||
-                            state.relation == CommitRelation.LOCAL_AHEAD)
-                } == true
-                Button(
-                    onClick = {
-                        val tokenForRun = token.toCharArray()
-                        token = ""
-                        runningOperation = "subir"
-                        uploadResult = null
-                        downloadResult = null
-                        synchronizationResult = null
-                        lastOperation = null
-                        scope.launch {
-                            try {
-                                val completed = withContext(Dispatchers.IO) {
-                                    repositoryStateService.uploadSafely(
-                                        functionalRepository,
-                                        tokenForRun,
-                                        commitMessage,
-                                    )
-                                }
-                                uploadResult = completed
-                                lastOperation = RestoredOperation(
-                                    operation = "↑ SUBIR",
-                                    outcome = completed.outcome.name,
-                                    message = completed.message,
-                                    detail = completed.error,
-                                )
-                                completed.finalState?.let { repositoryState = it }
-                                if (completed.outcome == UploadOutcome.SUCCESS ||
-                                    completed.outcome == UploadOutcome.NOTHING_TO_UPLOAD
-                                ) {
-                                    Log.i("RobGitState", "${completed.outcome}: ${completed.message}")
-                                } else {
-                                    Log.w(
-                                        "RobGitState",
-                                        "${completed.outcome}: ${completed.error ?: completed.message}",
-                                    )
-                                }
-                            } finally {
-                                tokenForRun.fill('\u0000')
-                                token = ""
-                                runningOperation = null
-                            }
-                        }
-                    },
-                    enabled = runningOperation == null && canUpload &&
-                        token.isNotBlank() && commitMessage.isNotBlank(),
-                    modifier = Modifier.fillMaxWidth(),
-                    contentPadding = PaddingValues(16.dp),
-                ) {
-                    Text("↑ SUBIR")
-                }
-            }
-            DownloadResultPanel(downloadResult)
-            UploadResultPanel(uploadResult)
-            SynchronizationResultPanel(synchronizationResult)
-            if (downloadResult == null && uploadResult == null && synchronizationResult == null) {
-                RestoredOperationPanel(lastOperation)
-            }
+            drawPath(path, RobGitColors.Ice, style = Stroke(width = stroke))
+        }
+        Text(
+            title,
+            style = titleStyle,
+            fontWeight = FontWeight.Bold,
+            color = RobGitColors.Ice,
+            modifier = Modifier.align(Alignment.TopStart).padding(start = titleStart),
+        )
+    }
+}
 
-            Text("Herramientas de diagnóstico", style = MaterialTheme.typography.headlineSmall)
-            Text("Prueba local", style = MaterialTheme.typography.titleLarge)
-            Button(
-                onClick = {
-                    runningOperation = "local"
-                    localResult = null
-                    val directory = File(diagnosticRoot, UUID.randomUUID().toString())
-                    scope.launch {
-                        try {
-                            val completed = withContext(Dispatchers.IO) {
-                                service.runLocalDiagnostic(directory)
-                            }
-                            localResult = completed
-                            logResult("local", completed)
-                        } catch (error: Throwable) {
-                            if (error !is Exception && error !is LinkageError) throw error
-                            val detail = describeFailure(error)
-                            localResult = DiagnosticResult(directory.absolutePath, "Sin consultar", "Sin commits", "Error", emptyList(), detail)
-                            Log.e("RobGitDiagnostic", "Fallo en la prueba local: $detail", error)
-                        } finally {
-                            runningOperation = null
-                        }
-                    }
-                },
-                enabled = runningOperation == null,
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(16.dp),
-            ) {
-                Text("EJECUTAR PRUEBA LOCAL")
-            }
-            DiagnosticResultPanel(localResult, runningOperation == "local")
-
-            Text("Clone HTTPS de GitHub (solo lectura)", style = MaterialTheme.typography.titleLarge)
-            Button(
-                onClick = {
-                    runningOperation = "remoto"
-                    remoteResult = null
-                    val directory = File(File(diagnosticRoot, "remote-clones"), UUID.randomUUID().toString())
-                    scope.launch {
-                        try {
-                            val completed = withContext(Dispatchers.IO) {
-                                service.runRemoteCloneDiagnostic(directory)
-                            }
-                            remoteResult = completed
-                            logResult("remoto", completed)
-                        } catch (error: Throwable) {
-                            if (error !is Exception && error !is LinkageError) throw error
-                            val detail = describeFailure(error)
-                            remoteResult = DiagnosticResult(directory.absolutePath, "Sin consultar", "Sin leer", "Error", emptyList(), detail)
-                            Log.e("RobGitDiagnostic", "Fallo en la prueba remota: $detail", error)
-                        } finally {
-                            runningOperation = null
-                        }
-                    }
-                },
-                enabled = runningOperation == null,
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(16.dp),
-            ) {
-                Text("EJECUTAR PRUEBA REMOTA")
-            }
-            DiagnosticResultPanel(remoteResult, runningOperation == "remoto")
-
-            Text("Push HTTPS autenticado", style = MaterialTheme.typography.titleLarge)
-            Text("Repositorio desechable: robdor80/Robgit.pruebas")
-            Text("Usa el mismo Token GitHub introducido en la zona funcional.")
-            Button(
-                onClick = {
-                    val tokenForRun = token.toCharArray()
-                    token = ""
-                    runningOperation = "push"
-                    pushResult = null
-                    val directory = File(File(diagnosticRoot, "authenticated-pushes"), UUID.randomUUID().toString())
-                    scope.launch {
-                        try {
-                            val completed = withContext(Dispatchers.IO) {
-                                service.runAuthenticatedPushDiagnostic(directory, tokenForRun)
-                            }
-                            pushResult = completed
-                            logResult("push autenticado", completed)
-                        } catch (error: Throwable) {
-                            if (error !is Exception && error !is LinkageError) throw error
-                            pushResult = DiagnosticResult(
-                                directory.absolutePath,
-                                "Sin consultar",
-                                "Sin leer",
-                                "Error inesperado",
-                                emptyList(),
-                                "La prueba terminó con un error inesperado sin detalles sensibles.",
-                            )
-                            Log.e("RobGitDiagnostic", "Fallo inesperado en la prueba de push autenticado")
-                        } finally {
-                            tokenForRun.fill('\u0000')
-                            token = ""
-                            runningOperation = null
-                        }
-                    }
-                },
-                enabled = runningOperation == null && token.isNotBlank(),
-                modifier = Modifier.fillMaxWidth(),
-                contentPadding = PaddingValues(16.dp),
-            ) {
-                Text("PRUEBA PUSH AUTENTICADO")
-            }
-            DiagnosticResultPanel(pushResult, runningOperation == "push")
+@Composable
+private fun ActionGrid(status: RepositoryHumanStatus, enabled: Boolean, onPull: () -> Unit, onPush: () -> Unit, onSync: () -> Unit, onAi: () -> Unit, modifier: Modifier = Modifier) {
+    val pullVisual = actionButtonVisualState(status, enabled, RepositoryAction.PULL)
+    val pushVisual = actionButtonVisualState(status, enabled, RepositoryAction.PUSH)
+    val syncVisual = actionButtonVisualState(status, enabled, RepositoryAction.SYNCHRONIZE)
+    val aiVisual = actionButtonVisualState(status, enabled, RepositoryAction.AI)
+    Column(modifier, verticalArrangement = Arrangement.spacedBy(14.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
+            RobGitActionButton("↓", "PULL", pullVisual, onPull, Modifier.weight(1f))
+            RobGitActionButton("↑", "PUSH", pushVisual, onPush, Modifier.weight(1f))
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
+            RobGitActionButton("↕", "SINCRONIZAR", syncVisual, onSync, Modifier.weight(1f))
+            RobGitActionButton("✦", "IA", aiVisual, onAi, Modifier.weight(1f), RobGitColors.Ai)
         }
     }
 }
 
-@Composable
-private fun RepositoryStatePanel(snapshot: RepositoryStateSnapshot) {
-    val title = when (snapshot.type) {
-        RepositoryStateType.SYNCHRONIZED -> "✅ Sincronizado"
-        RepositoryStateType.LOCAL_CHANGES -> "⬆ Cambios locales pendientes"
-        RepositoryStateType.LOCAL_AHEAD -> "⬆ Local adelantado"
-        RepositoryStateType.REMOTE_AHEAD -> "⬇ GitHub adelantado"
-        RepositoryStateType.DIVERGED -> "↕ Repositorio divergente"
-        RepositoryStateType.ERROR -> "⚠ Estado no determinable"
-    }
-    Text(title, style = MaterialTheme.typography.titleLarge)
-    Text(snapshot.message)
-    Text("Rama: ${snapshot.branch ?: "desconocida"}")
-    Text("HEAD local: ${snapshot.localHead?.take(7) ?: "desconocido"}")
-    Text("origin/main: ${snapshot.remoteHead?.take(7) ?: "desconocido"}")
-    Text("Ahead: ${snapshot.ahead} · Behind: ${snapshot.behind}")
-    if (snapshot.type == RepositoryStateType.LOCAL_CHANGES) {
-        Text("Relación de commits: ${snapshot.relation}")
-    }
-    StateFiles("Nuevos", snapshot.changes.newFiles)
-    StateFiles("Modificados", snapshot.changes.modifiedFiles)
-    StateFiles("Eliminados", snapshot.changes.deletedFiles)
-    StateFiles("Staged", snapshot.changes.stagedFiles)
-    StateFiles("En conflicto", snapshot.changes.conflictingFiles)
-    Text("Remoto actualizado: ${if (snapshot.remoteStateIsFresh) "sí" else "no"}")
-    Text("Última comprobación: ${snapshot.checkedAt}")
-    snapshot.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-}
-
-@Composable
-private fun StateFiles(label: String, files: Set<String>) {
-    if (files.isNotEmpty()) {
-        Text("$label (${files.size}): ${files.joinToString()}")
-    }
-}
-
-@Composable
-private fun DownloadResultPanel(result: DownloadResult?) {
-    result ?: return
-    val prefix = when (result.outcome) {
-        DownloadOutcome.SUCCESS -> "✓"
-        DownloadOutcome.ALREADY_SYNCHRONIZED -> "="
-        else -> "⚠"
-    }
-    Text("$prefix ${result.message}")
-    Text("Resultado: ${result.outcome}")
-    if (result.previousHead != null || result.newHead != null) {
-        Text(
-            "HEAD: ${result.previousHead?.take(7) ?: "desconocido"} → " +
-                (result.newHead?.take(7) ?: "desconocido"),
-        )
-    }
-    if (result.outcome == DownloadOutcome.SUCCESS) {
-        Text("Commits descargados: ${result.commitsDownloaded}")
-        Text("Working tree limpio: ${if (result.workingTreeClean) "sí" else "no"}")
-    }
-    result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-}
-
-@Composable
-private fun UploadResultPanel(result: UploadResult?) {
-    result ?: return
-    val prefix = when (result.outcome) {
-        UploadOutcome.SUCCESS -> "✓"
-        UploadOutcome.NOTHING_TO_UPLOAD -> "="
-        else -> "⚠"
-    }
-    Text("$prefix ${result.message}")
-    Text("Resultado: ${result.outcome}")
-    if (result.previousHead != null || result.attemptedHead != null) {
-        Text(
-            "HEAD: ${result.previousHead?.take(7) ?: "desconocido"} → " +
-                (result.attemptedHead?.take(7) ?: "desconocido"),
-        )
-    }
-    if (result.commitCreated) {
-        Text("Commit local creado y conservado: sí")
-    }
-    if (result.outcome == UploadOutcome.SUCCESS) {
-        Text("Commits subidos: ${result.commitsUploaded}")
-    }
-    result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-}
-
-@Composable
-private fun SynchronizationResultPanel(result: SynchronizationResult?) {
-    result ?: return
-    val prefix = when (result.outcome) {
-        SynchronizationOutcome.SUCCESS_DOWNLOADED,
-        SynchronizationOutcome.SUCCESS_UPLOADED,
-        -> "✓"
-        SynchronizationOutcome.NOTHING_TO_DO -> "="
-        else -> "⚠"
-    }
-    Text("$prefix ${result.message}")
-    Text("Resultado: ${result.outcome}")
-    result.finalState?.let { state ->
-        Text("Ahead: ${state.ahead} · Behind: ${state.behind}")
-    }
-    result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-}
-
-@Composable
-private fun RestoredOperationPanel(operation: RestoredOperation?) {
-    operation ?: return
-    Text("Última operación: ${operation.operation}")
-    Text("Resultado: ${operation.outcome}")
-    Text(operation.message)
-    operation.detail?.let { Text(it, color = MaterialTheme.colorScheme.error) }
-}
-
-@Composable
-private fun DiagnosticResultPanel(result: DiagnosticResult?, running: Boolean) {
-    Text("JGit: ${if (running) "ejecutando" else if (result == null) "pendiente" else if (result.error == null) "correcto" else "error"}")
-    Text("Directorio del repositorio: ${result?.repositoryPath ?: "pendiente"}")
-    Text("Rama: ${result?.branch ?: "pendiente"}")
-    Text("Último commit: ${result?.lastCommit ?: "pendiente"}")
-    Text("Estado: ${result?.status ?: "pendiente"}")
-    result?.steps?.forEach { step ->
-        Text("✓ ${step.description}${if (step.detail.isBlank()) "" else ": ${step.detail}"}")
-    }
-    result?.error?.let { Text("✗ $it", color = MaterialTheme.colorScheme.error) }
-}
-
-private fun logResult(operation: String, result: DiagnosticResult) {
-    result.steps.forEach { Log.i("RobGitDiagnostic", "$operation — ${it.description}: ${it.detail}") }
-    result.error?.let { Log.e("RobGitDiagnostic", "$operation — $it") }
-}
-
-private fun describeFailure(error: Throwable): String = generateSequence(error) { it.cause }
-    .take(5)
-    .joinToString(" ← ") { "${it.javaClass.name}: ${it.message ?: "sin detalle"}" }
-
-internal data class RestoredOperation(
-    val operation: String,
-    val outcome: String,
-    val message: String,
-    val detail: String?,
+internal data class ActionButtonVisualState(
+    val enabled: Boolean,
+    val recommended: Boolean,
+    val borderWidth: androidx.compose.ui.unit.Dp,
+    val borderAlpha: Float,
+    val contentAlpha: Float,
 )
 
-internal val lastOperationSaver = Saver<RestoredOperation?, Any>(
-    save = { operation ->
-        operation?.let { listOf(it.operation, it.outcome, it.message, it.detail) }
-    },
-    restore = { saved ->
-        val values = saved as? List<*> ?: return@Saver null
-        RestoredOperation(
-            operation = values.getOrNull(0) as? String ?: return@Saver null,
-            outcome = values.getOrNull(1) as? String ?: return@Saver null,
-            message = values.getOrNull(2) as? String ?: return@Saver null,
-            detail = values.getOrNull(3) as? String,
-        )
-    },
-)
+internal fun actionButtonVisualState(
+    status: RepositoryHumanStatus,
+    screenEnabled: Boolean,
+    action: RepositoryAction,
+): ActionButtonVisualState {
+    val enabled = screenEnabled && when (action) {
+        RepositoryAction.PULL -> status.pullEnabled
+        RepositoryAction.PUSH -> status.pushEnabled
+        RepositoryAction.SYNCHRONIZE, RepositoryAction.AI -> true
+    }
+    return ActionButtonVisualState(
+        enabled = enabled,
+        recommended = status.recommendedAction == action,
+        borderWidth = RobGitDimens.Border,
+        borderAlpha = if (enabled) 1f else .6f,
+        contentAlpha = if (enabled) 1f else .42f,
+    )
+}
 
-internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(
-    save = { state ->
-        state?.let {
-            listOf(
-                it.type.name,
-                it.relation.name,
-                it.message,
-                it.branch,
-                it.localHead,
-                it.remoteHead,
-                it.ahead,
-                it.behind,
-                it.changes.newFiles.toList(),
-                it.changes.modifiedFiles.toList(),
-                it.changes.deletedFiles.toList(),
-                it.changes.stagedFiles.toList(),
-                it.changes.conflictingFiles.toList(),
-                it.checkedAt.toString(),
-                it.remoteStateIsFresh,
-                it.error,
-            )
+@Composable
+private fun RobGitActionButton(icon: String, label: String, visual: ActionButtonVisualState, onClick: () -> Unit, modifier: Modifier, iconColor: Color = RobGitColors.Ice) {
+    val interaction = remember { MutableInteractionSource() }; val pressed by interaction.collectIsPressedAsState()
+    val elevation by animateDpAsState(if (pressed) 1.dp else 5.dp, label = "relieve"); val shape = RoundedCornerShape(RobGitDimens.Radius)
+    Box(contentAlignment = Alignment.Center, modifier = modifier.widthIn(max = RobGitDimens.ButtonMax).aspectRatio(1f).shadow(elevation, shape, ambientColor = RobGitColors.PetroleumDeep, spotColor = RobGitColors.PetroleumDeep).background(RobGitColors.PetroleumDark, shape).clickable(interactionSource = interaction, indication = null, enabled = visual.enabled, role = Role.Button, onClick = onClick).semantics { contentDescription = label }) {
+        Column(Modifier.alpha(visual.contentAlpha), horizontalAlignment = Alignment.CenterHorizontally) { Text(icon, fontSize = 42.sp, color = iconColor, lineHeight = 44.sp); Spacer(Modifier.height(7.dp)); Text(label, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center) }
+        Box(Modifier.matchParentSize().border(visual.borderWidth, (if (visual.recommended) Color.White else RobGitColors.Ice).copy(alpha = visual.borderAlpha), shape))
+    }
+}
+
+@Composable
+private fun AuthenticationDialog(purpose: AuthPurpose, onDismiss: () -> Unit, onConfirm: (CharArray, String) -> Unit) {
+    var token by remember { mutableStateOf("") }; var message by remember { mutableStateOf("Cambios desde RobGit") }
+    AlertDialog(onDismissRequest = { token = ""; onDismiss() }, title = { Text(if (purpose == AuthPurpose.DIAGNOSTIC) "Prueba autenticada" else "Autorizar en GitHub") }, text = {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Text("El token solo se conserva en memoria durante esta operación.")
+            OutlinedTextField(token, { token = it }, label = { Text("Token GitHub") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), singleLine = true)
+            if (purpose != AuthPurpose.DIAGNOSTIC) OutlinedTextField(message, { message = it }, label = { Text("Mensaje del cambio") }, singleLine = true)
         }
-    },
-    restore = { saved ->
-        val values = saved as? List<*> ?: return@Saver null
-        fun stringAt(index: Int): String? = values.getOrNull(index) as? String
-        fun filesAt(index: Int): Set<String> =
-            (values.getOrNull(index) as? List<*>)
-                ?.mapNotNull { it as? String }
-                ?.toSet()
-                ?: emptySet()
-        val type = stringAt(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() }
-            ?: return@Saver null
-        val relation = stringAt(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() }
-            ?: return@Saver null
-        val checkedAt = stringAt(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() }
-            ?: return@Saver null
-        RepositoryStateSnapshot(
-            type = type,
-            relation = relation,
-            message = stringAt(2) ?: return@Saver null,
-            branch = stringAt(3),
-            localHead = stringAt(4),
-            remoteHead = stringAt(5),
-            ahead = values.getOrNull(6) as? Int ?: return@Saver null,
-            behind = values.getOrNull(7) as? Int ?: return@Saver null,
-            changes = WorkingTreeChanges(
-                newFiles = filesAt(8),
-                modifiedFiles = filesAt(9),
-                deletedFiles = filesAt(10),
-                stagedFiles = filesAt(11),
-                conflictingFiles = filesAt(12),
-            ),
-            checkedAt = checkedAt,
-            remoteStateIsFresh = values.getOrNull(14) as? Boolean ?: return@Saver null,
-            error = stringAt(15),
-        )
-    },
-)
+    }, confirmButton = { Button(enabled = token.isNotBlank() && (purpose == AuthPurpose.DIAGNOSTIC || message.isNotBlank()), onClick = { val secret = token.toCharArray(); token = ""; onConfirm(secret, message.trim()) }) { Text("CONTINUAR") } }, dismissButton = { TextButton(onClick = { token = ""; onDismiss() }) { Text("CANCELAR") } })
+}
+
+@Composable
+private fun AiAssistantDialog(onDismiss: () -> Unit) {
+    val commands = listOf("Analizar el repositorio", "Explícame el estado actual", "¿Qué debería hacer ahora?", "Resumir los cambios", "Explicar un bloqueo o conflicto", "Pregunta personalizada")
+    var selected by remember { mutableStateOf(commands.first()) }; var menu by remember { mutableStateOf(false) }; var question by remember { mutableStateOf("") }; var attempted by remember { mutableStateOf(false) }
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("Asistente RobGit") }, text = {
+        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            Box { OutlinedButton({ menu = true }, Modifier.fillMaxWidth()) { Text("$selected  ▾") }; DropdownMenu(menu, { menu = false }) { commands.forEach { c -> DropdownMenuItem({ Text(c) }, { selected = c; menu = false }) } } }
+            OutlinedTextField(question, { question = it }, label = { Text("Pregunta libre") }, minLines = 3, modifier = Modifier.fillMaxWidth())
+            if (attempted) Text("El asistente IA todavía no está conectado. La interfaz está preparada para el próximo hito.", color = RobGitColors.Ai)
+        }
+    }, confirmButton = { Button({ attempted = true }) { Text("PREGUNTAR") } }, dismissButton = { TextButton(onDismiss) { Text("CERRAR") } })
+}
+
+@Composable
+private fun TechnicalDetailsDialog(state: RepositoryStateSnapshot?, operation: RestoredOperation?, onDismiss: () -> Unit) {
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("Detalles técnicos") }, text = {
+        Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            if (state == null) Text("Todavía no hay un análisis disponible.") else {
+                Text("Rama: ${state.branch ?: "desconocida"}"); Text("HEAD: ${state.localHead ?: "desconocido"}"); Text("origin/main: ${state.remoteHead ?: "desconocido"}")
+                Text("Ahead: ${state.ahead} · Behind: ${state.behind}"); Text("Working tree: ${if (state.changes.hasChanges) "con cambios" else "limpio"}")
+                TechnicalFiles("Nuevos", state.changes.newFiles); TechnicalFiles("Modificados", state.changes.modifiedFiles); TechnicalFiles("Eliminados", state.changes.deletedFiles); TechnicalFiles("Staged", state.changes.stagedFiles); TechnicalFiles("Conflictos", state.changes.conflictingFiles)
+                Text("Remoto actualizado: ${if (state.remoteStateIsFresh) "sí" else "no"}"); Text("Comprobado: ${state.checkedAt}"); state.error?.let { Text("Error: $it", color = RobGitColors.Error) }
+            }
+            operation?.let { Text("Última operación: ${it.operation} — ${it.outcome}") }
+        }
+    }, confirmButton = { TextButton(onDismiss) { Text("CERRAR") } })
+}
+
+@Composable private fun TechnicalFiles(label: String, files: Set<String>) { Text("$label (${files.size}): ${if (files.isEmpty()) "—" else files.joinToString()}") }
+
+@Composable
+private fun SettingsDialog(running: String?, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit) {
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("Ajustes · Avanzado / Diagnóstico") }, text = {
+        Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Herramientas de laboratorio", color = RobGitColors.IceMuted)
+            Button(onLocal, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PRUEBA LOCAL JGIT") }; DiagnosticSummary(localResult)
+            Button(onRemote, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("CLONE HTTPS") }; DiagnosticSummary(remoteResult)
+            Button(onAuthenticated, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PUSH HTTPS AUTENTICADO") }; DiagnosticSummary(pushResult)
+            running?.let { Text("Ejecutando: $it…") }
+        }
+    }, confirmButton = { TextButton(onDismiss) { Text("CERRAR") } })
+}
+@Composable private fun DiagnosticSummary(result: DiagnosticResult?) { result?.let { Text(if (it.error == null) "Correcto · ${it.status}" else "Error · ${it.error}", style = MaterialTheme.typography.bodySmall) } }
+
+internal data class RestoredOperation(val operation: String, val outcome: String, val message: String, val detail: String?)
+internal val lastOperationSaver = Saver<RestoredOperation?, Any>(save = { it?.let { o -> listOf(o.operation, o.outcome, o.message, o.detail) } }, restore = { saved ->
+    val v = saved as? List<*> ?: return@Saver null
+    RestoredOperation(v.getOrNull(0) as? String ?: return@Saver null, v.getOrNull(1) as? String ?: return@Saver null, v.getOrNull(2) as? String ?: return@Saver null, v.getOrNull(3) as? String)
+})
+internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(save = { s -> s?.let { listOf(it.type.name, it.relation.name, it.message, it.branch, it.localHead, it.remoteHead, it.ahead, it.behind, it.changes.newFiles.toList(), it.changes.modifiedFiles.toList(), it.changes.deletedFiles.toList(), it.changes.stagedFiles.toList(), it.changes.conflictingFiles.toList(), it.checkedAt.toString(), it.remoteStateIsFresh, it.error) } }, restore = { saved ->
+    val v = saved as? List<*> ?: return@Saver null
+    fun str(i: Int) = v.getOrNull(i) as? String
+    fun files(i: Int) = (v.getOrNull(i) as? List<*>)?.mapNotNull { it as? String }?.toSet() ?: emptySet()
+    RepositoryStateSnapshot(str(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() } ?: return@Saver null, str(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() } ?: return@Saver null, str(2) ?: return@Saver null, str(3), str(4), str(5), v.getOrNull(6) as? Int ?: return@Saver null, v.getOrNull(7) as? Int ?: return@Saver null, WorkingTreeChanges(files(8), files(9), files(10), files(11), files(12)), str(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() } ?: return@Saver null, v.getOrNull(14) as? Boolean ?: return@Saver null, str(15))
+})
