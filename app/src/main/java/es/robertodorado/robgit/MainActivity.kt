@@ -1,9 +1,14 @@
 package es.robertodorado.robgit
 
 import android.content.pm.ActivityInfo
+import android.content.Intent
 import android.os.Bundle
+import android.os.Environment
+import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.Image
@@ -33,6 +38,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -79,7 +85,8 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class AuthPurpose { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, DIAGNOSTIC }
+private enum class AuthPurpose { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, WORKSPACE_PREPARE, WORKSPACE_ANALYZE, WORKSPACE_PULL, WORKSPACE_PUSH, WORKSPACE_SYNCHRONIZE, DIAGNOSTIC }
+private enum class SharedWorkspaceAction { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, FILESYSTEM }
 
 @Composable
 private fun RobGitScreen(
@@ -113,7 +120,90 @@ private fun RobGitScreen(
     var addError by remember { mutableStateOf<String?>(null) }
     var pendingRemoval by remember { mutableStateOf<RepositoryConfig?>(null) }
     var preparedRepositories by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
+    var showSharedWorkspace by remember { mutableStateOf(false) }
+    var sharedWorkspaceResult by remember { mutableStateOf<SharedWorkspaceResult?>(null) }
+    var activeWorkspaceOperation by remember { mutableStateOf<String?>(null) }
+    var hasAllFilesAccess by remember { mutableStateOf(Environment.isExternalStorageManager()) }
+    val context = LocalContext.current
+    @Suppress("DEPRECATION")
+    val documentsDirectory = remember(context) {
+        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+    }
+    val sharedWorkspaceProbe = remember(documentsDirectory) {
+        SharedWorkspaceProbe(documentsDirectory, { Environment.isExternalStorageManager() })
+    }
+    val workspacePermissionLauncher = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+        hasAllFilesAccess = Environment.isExternalStorageManager()
+    }
     val scope = rememberCoroutineScope()
+
+    fun requestWorkspaceAccess() {
+        val packageSettings = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+            .setData(android.net.Uri.fromParts("package", context.packageName, null))
+        val intent = if (context.packageManager.resolveActivity(packageSettings, 0) != null) packageSettings
+            else Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+        workspacePermissionLauncher.launch(intent)
+    }
+
+    fun runSharedWorkspace(action: SharedWorkspaceAction, token: CharArray = charArrayOf(), message: String = "Prueba workspace compartido") {
+        if (runningOperation != null) {
+            token.fill('\u0000')
+            return
+        }
+        val suppliedToken = token.isNotEmpty()
+        val operationLabel = when (action) {
+            SharedWorkspaceAction.PREPARE -> "PREPARAR WORKSPACE"
+            SharedWorkspaceAction.ANALYZE -> "ANALIZAR WORKSPACE"
+            SharedWorkspaceAction.PULL -> "PULL DE PRUEBA"
+            SharedWorkspaceAction.PUSH -> "PUSH DE PRUEBA"
+            SharedWorkspaceAction.SYNCHRONIZE -> "SINCRONIZAR DE PRUEBA"
+            SharedWorkspaceAction.FILESYSTEM -> "PROBAR FILESYSTEM"
+        }
+        sharedWorkspaceResult = null
+        activeWorkspaceOperation = operationLabel
+        runningOperation = operationLabel
+        scope.launch {
+            try {
+                val result = withContext(Dispatchers.IO) {
+                    when (action) {
+                        SharedWorkspaceAction.PREPARE -> sharedWorkspaceProbe.prepare(token)
+                        SharedWorkspaceAction.ANALYZE -> sharedWorkspaceProbe.analyze(token)
+                        SharedWorkspaceAction.PULL -> sharedWorkspaceProbe.pull(token)
+                        SharedWorkspaceAction.PUSH -> sharedWorkspaceProbe.push(token, message)
+                        SharedWorkspaceAction.SYNCHRONIZE -> sharedWorkspaceProbe.synchronize(token, message)
+                        SharedWorkspaceAction.FILESYSTEM -> sharedWorkspaceProbe.probeFilesystem()
+                    }
+                }
+                sharedWorkspaceResult = result
+                if (result.authenticationRequired && !suppliedToken) {
+                    authPurpose = when (action) {
+                        SharedWorkspaceAction.PREPARE -> AuthPurpose.WORKSPACE_PREPARE
+                        SharedWorkspaceAction.ANALYZE -> AuthPurpose.WORKSPACE_ANALYZE
+                        SharedWorkspaceAction.PULL -> AuthPurpose.WORKSPACE_PULL
+                        SharedWorkspaceAction.PUSH -> AuthPurpose.WORKSPACE_PUSH
+                        SharedWorkspaceAction.SYNCHRONIZE -> AuthPurpose.WORKSPACE_SYNCHRONIZE
+                        SharedWorkspaceAction.FILESYSTEM -> null
+                    }
+                } else if (result.authenticationRequired) {
+                    RepositoryStatusPresenter.authFailed().let {
+                        sharedWorkspaceResult = result.copy(message = "${it.title} ${it.explanation}")
+                    }
+                }
+            } catch (failure: Exception) {
+                if (failure is kotlinx.coroutines.CancellationException) throw failure
+                sharedWorkspaceResult = SharedWorkspaceResult(
+                    operation = operationLabel,
+                    success = false,
+                    message = "No se pudo completar la operación (${failure.javaClass.simpleName}).",
+                    repositoryPath = sharedWorkspaceProbe.repositoryDirectory.absolutePath,
+                )
+            } finally {
+                token.fill('\u0000')
+                activeWorkspaceOperation = null
+                runningOperation = null
+            }
+        }
+    }
 
     LaunchedEffect(Unit) {
         val loaded = withContext(Dispatchers.IO) { registry.load() }
@@ -377,6 +467,26 @@ private fun RobGitScreen(
             dismissButton = { TextButton(onClick = { pendingRemoval = null; showSettings = true }) { Text("CANCELAR") } },
         )
     }
+    if (showSharedWorkspace) SharedWorkspaceDiagnosticDialog(
+        permissionGranted = hasAllFilesAccess,
+        rootPath = sharedWorkspaceProbe.rootDirectory.absolutePath,
+        repositoryPath = sharedWorkspaceProbe.repositoryDirectory.absolutePath,
+        result = sharedWorkspaceResult,
+        runningLabel = activeWorkspaceOperation,
+        busy = runningOperation != null,
+        onGrantAccess = ::requestWorkspaceAccess,
+        onAction = { action ->
+            when (action) {
+                SharedWorkspaceAction.PUSH -> authPurpose = AuthPurpose.WORKSPACE_PUSH
+                SharedWorkspaceAction.PREPARE -> runSharedWorkspace(action)
+                SharedWorkspaceAction.ANALYZE -> runSharedWorkspace(action)
+                SharedWorkspaceAction.PULL -> runSharedWorkspace(action)
+                SharedWorkspaceAction.SYNCHRONIZE -> runSharedWorkspace(action)
+                SharedWorkspaceAction.FILESYSTEM -> runSharedWorkspace(action)
+            }
+        },
+        onDismiss = { showSharedWorkspace = false; sharedWorkspaceResult = null; activeWorkspaceOperation = null },
+    )
     if (showSettings) SettingsDialog(runningOperation, catalog, preparedRepositories, localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
         { config -> showSettings = false; pendingRemoval = config },
         {
@@ -389,7 +499,12 @@ private fun RobGitScreen(
                 remoteDiagnostic = withContext(Dispatchers.IO) { gitService.runRemoteCloneDiagnostic(File(diagnosticRoot, "remote-clones/${UUID.randomUUID()}")) }
                 runningOperation = null
             }
-        }, { authPurpose = AuthPurpose.DIAGNOSTIC })
+        }, { authPurpose = AuthPurpose.DIAGNOSTIC }, {
+            showSettings = false
+            sharedWorkspaceResult = null
+            activeWorkspaceOperation = null
+            showSharedWorkspace = true
+        })
     authPurpose?.let { purpose ->
         AuthenticationDialog(purpose, { authPurpose = null }) { token, message ->
             authPurpose = null
@@ -399,6 +514,11 @@ private fun RobGitScreen(
                 AuthPurpose.PULL -> pull(token)
                 AuthPurpose.PUSH -> upload(token, message)
                 AuthPurpose.SYNCHRONIZE -> synchronize(token, message)
+                AuthPurpose.WORKSPACE_PREPARE -> runSharedWorkspace(SharedWorkspaceAction.PREPARE, token, message)
+                AuthPurpose.WORKSPACE_ANALYZE -> runSharedWorkspace(SharedWorkspaceAction.ANALYZE, token, message)
+                AuthPurpose.WORKSPACE_PULL -> runSharedWorkspace(SharedWorkspaceAction.PULL, token, message)
+                AuthPurpose.WORKSPACE_PUSH -> runSharedWorkspace(SharedWorkspaceAction.PUSH, token, message)
+                AuthPurpose.WORKSPACE_SYNCHRONIZE -> runSharedWorkspace(SharedWorkspaceAction.SYNCHRONIZE, token, message)
                 AuthPurpose.DIAGNOSTIC -> {
                     runningOperation = "diagnóstico push"; scope.launch {
                         try {
@@ -591,9 +711,13 @@ private fun AuthenticationDialog(purpose: AuthPurpose, onDismiss: () -> Unit, on
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("El token solo se conserva en memoria durante esta operación.")
             OutlinedTextField(token, { token = it }, label = { Text("Token GitHub") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), singleLine = true)
-            if (purpose == AuthPurpose.PUSH || purpose == AuthPurpose.SYNCHRONIZE) OutlinedTextField(message, { message = it }, label = { Text("Mensaje del cambio") }, singleLine = true)
+            if (purpose == AuthPurpose.PUSH || purpose == AuthPurpose.SYNCHRONIZE ||
+                purpose == AuthPurpose.WORKSPACE_PUSH || purpose == AuthPurpose.WORKSPACE_SYNCHRONIZE
+            ) OutlinedTextField(message, { message = it }, label = { Text("Mensaje del cambio") }, singleLine = true)
         }
-    }, confirmButton = { Button(enabled = token.isNotBlank() && ((purpose != AuthPurpose.PUSH && purpose != AuthPurpose.SYNCHRONIZE) || message.isNotBlank()), onClick = { val secret = token.toCharArray(); token = ""; onConfirm(secret, message.trim()) }) { Text("CONTINUAR") } }, dismissButton = { TextButton(onClick = { token = ""; onDismiss() }) { Text("CANCELAR") } })
+    }, confirmButton = { Button(enabled = token.isNotBlank() &&
+        ((purpose != AuthPurpose.PUSH && purpose != AuthPurpose.SYNCHRONIZE && purpose != AuthPurpose.WORKSPACE_PUSH && purpose != AuthPurpose.WORKSPACE_SYNCHRONIZE) || message.isNotBlank()),
+        onClick = { val secret = token.toCharArray(); token = ""; onConfirm(secret, message.trim()) }) { Text("CONTINUAR") } }, dismissButton = { TextButton(onClick = { token = ""; onDismiss() }) { Text("CANCELAR") } })
 }
 
 @Composable
@@ -659,7 +783,7 @@ private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, 
 @Composable private fun TechnicalFiles(label: String, files: Set<String>) { Text("$label (${files.size}): ${if (files.isEmpty()) "—" else files.joinToString()}") }
 
 @Composable
-private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepared: Map<String, Boolean>, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onRemove: (RepositoryConfig) -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit) {
+private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepared: Map<String, Boolean>, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onRemove: (RepositoryConfig) -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit, onSharedWorkspace: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Ajustes") }, text = {
         Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("REPOSITORIOS", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
@@ -670,12 +794,75 @@ private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepar
                 TextButton(onClick = { onRemove(config) }, enabled = running == null) { Text("QUITAR DE ROBGIT") }
             }
             Text("AVANZADO / DIAGNÓSTICO", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
+            Button(onSharedWorkspace, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PRUEBA WORKSPACE COMPARTIDO") }
             Button(onLocal, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PRUEBA LOCAL JGIT") }; DiagnosticSummary(localResult)
             Button(onRemote, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("CLONE HTTPS") }; DiagnosticSummary(remoteResult)
             Button(onAuthenticated, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PUSH HTTPS AUTENTICADO") }; DiagnosticSummary(pushResult)
             running?.let { Text("Ejecutando: $it…") }
         }
     }, confirmButton = { TextButton(onDismiss) { Text("CERRAR") } })
+}
+
+@Composable
+private fun SharedWorkspaceDiagnosticDialog(
+    permissionGranted: Boolean,
+    rootPath: String,
+    repositoryPath: String,
+    result: SharedWorkspaceResult?,
+    runningLabel: String?,
+    busy: Boolean,
+    onGrantAccess: () -> Unit,
+    onAction: (SharedWorkspaceAction) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Prueba workspace compartido") },
+        text = {
+            Column(
+                Modifier
+                    .heightIn(max = 560.dp)
+                    .verticalScroll(rememberScrollState())
+                    .padding(bottom = 24.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text("ACCESO AL WORKSPACE", fontWeight = FontWeight.Bold)
+                Text(if (permissionGranted) "Concedido" else "No concedido", color = if (permissionGranted) RobGitColors.Success else RobGitColors.Warning)
+                Text("Ruta raíz: $rootPath")
+                Text("Repositorio de prueba: $SHARED_WORKSPACE_DIRECTORY")
+                Text("Ruta del repositorio: $repositoryPath", style = MaterialTheme.typography.bodySmall)
+                Text("Remoto: $SHARED_WORKSPACE_REMOTE", style = MaterialTheme.typography.bodySmall)
+                Text("Rama: $SHARED_WORKSPACE_BRANCH")
+                if (!permissionGranted) OutlinedButton(onGrantAccess, enabled = !busy, modifier = Modifier.fillMaxWidth()) { Text("CONCEDER ACCESO") }
+                HorizontalDivider(color = RobGitColors.Ice.copy(alpha = .35f))
+                Text("RESULTADO", fontWeight = FontWeight.Bold, color = RobGitColors.IceMuted)
+                if (busy) Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp, color = RobGitColors.Warning)
+                    Spacer(Modifier.width(10.dp))
+                    Text("Ejecutando ${runningLabel ?: "operación"}…", color = RobGitColors.Warning)
+                }
+                result?.let { latest ->
+                    val feedback = sharedWorkspaceFeedback(latest)
+                    Text(feedback.title, fontWeight = FontWeight.Bold,
+                        color = if (latest.success) RobGitColors.Success else RobGitColors.Warning)
+                    Text(feedback.detail, color = RobGitColors.IceMuted)
+                }
+                if (!busy && result == null) Text("Todavía no se ha ejecutado ninguna operación.", color = RobGitColors.IceMuted)
+                val actions = listOf(
+                    SharedWorkspaceAction.PREPARE to "PREPARAR WORKSPACE",
+                    SharedWorkspaceAction.ANALYZE to "ANALIZAR WORKSPACE",
+                    SharedWorkspaceAction.PULL to "PULL DE PRUEBA",
+                    SharedWorkspaceAction.PUSH to "PUSH DE PRUEBA",
+                    SharedWorkspaceAction.SYNCHRONIZE to "SINCRONIZAR DE PRUEBA",
+                    SharedWorkspaceAction.FILESYSTEM to "PROBAR FILESYSTEM",
+                )
+                actions.forEach { (action, label) ->
+                    OutlinedButton(onClick = { onAction(action) }, enabled = permissionGranted && !busy, modifier = Modifier.fillMaxWidth()) { Text(label) }
+                }
+            }
+        },
+        confirmButton = { TextButton(onDismiss, enabled = !busy) { Text("CERRAR") } },
+    )
 }
 @Composable private fun DiagnosticSummary(result: DiagnosticResult?) { result?.let { Text(if (it.error == null) "Correcto · ${it.status}" else "Error · ${it.error}", style = MaterialTheme.typography.bodySmall) } }
 
