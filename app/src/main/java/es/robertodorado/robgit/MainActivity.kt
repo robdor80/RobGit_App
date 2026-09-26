@@ -66,6 +66,8 @@ private fun DiagnosticScreen(
     var preparationResult by remember { mutableStateOf<RepositoryPreparationResult?>(null) }
     var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
     var downloadResult by remember { mutableStateOf<DownloadResult?>(null) }
+    var uploadResult by remember { mutableStateOf<UploadResult?>(null) }
+    var commitMessage by remember { mutableStateOf("Cambios desde RobGit") }
     var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var pushResult by remember { mutableStateOf<DiagnosticResult?>(null) }
@@ -101,6 +103,7 @@ private fun DiagnosticScreen(
                         preparationResult = null
                         repositoryState = null
                         downloadResult = null
+                        uploadResult = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -130,6 +133,7 @@ private fun DiagnosticScreen(
                         runningOperation = "actualizar estado"
                         repositoryState = null
                         downloadResult = null
+                        uploadResult = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -155,7 +159,8 @@ private fun DiagnosticScreen(
             }
             if (runningOperation == "preparar repositorio" ||
                 runningOperation == "actualizar estado" ||
-                runningOperation == "descargar"
+                runningOperation == "descargar" ||
+                runningOperation == "subir"
             ) {
                 Text("Consultando repositorio…")
             }
@@ -165,6 +170,27 @@ private fun DiagnosticScreen(
             }
             repositoryState?.let { RepositoryStatePanel(it) }
             if (repositoryPrepared == true) {
+                OutlinedTextField(
+                    value = commitMessage,
+                    onValueChange = { commitMessage = it },
+                    label = { Text("Mensaje del cambio") },
+                    enabled = runningOperation == null,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = token,
+                    onValueChange = { token = it },
+                    label = { Text("Token GitHub") },
+                    visualTransformation = PasswordVisualTransformation(),
+                    keyboardOptions = KeyboardOptions(
+                        keyboardType = KeyboardType.Password,
+                        autoCorrectEnabled = false,
+                    ),
+                    enabled = runningOperation == null,
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
                 val canDownload = repositoryState?.let { state ->
                     state.type == RepositoryStateType.REMOTE_AHEAD &&
                         state.relation == CommitRelation.REMOTE_AHEAD &&
@@ -177,6 +203,7 @@ private fun DiagnosticScreen(
                     onClick = {
                         runningOperation = "descargar"
                         downloadResult = null
+                        uploadResult = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -205,8 +232,57 @@ private fun DiagnosticScreen(
                 ) {
                     Text("↓ DESCARGAR")
                 }
+                val canUpload = repositoryState?.let { state ->
+                    state.remoteStateIsFresh &&
+                        state.changes.conflictingFiles.isEmpty() &&
+                        (state.relation == CommitRelation.SYNCHRONIZED ||
+                            state.relation == CommitRelation.LOCAL_AHEAD)
+                } == true
+                Button(
+                    onClick = {
+                        val tokenForRun = token.toCharArray()
+                        token = ""
+                        runningOperation = "subir"
+                        uploadResult = null
+                        downloadResult = null
+                        scope.launch {
+                            try {
+                                val completed = withContext(Dispatchers.IO) {
+                                    repositoryStateService.uploadSafely(
+                                        functionalRepository,
+                                        tokenForRun,
+                                        commitMessage,
+                                    )
+                                }
+                                uploadResult = completed
+                                completed.finalState?.let { repositoryState = it }
+                                if (completed.outcome == UploadOutcome.SUCCESS ||
+                                    completed.outcome == UploadOutcome.NOTHING_TO_UPLOAD
+                                ) {
+                                    Log.i("RobGitState", "${completed.outcome}: ${completed.message}")
+                                } else {
+                                    Log.w(
+                                        "RobGitState",
+                                        "${completed.outcome}: ${completed.error ?: completed.message}",
+                                    )
+                                }
+                            } finally {
+                                tokenForRun.fill('\u0000')
+                                token = ""
+                                runningOperation = null
+                            }
+                        }
+                    },
+                    enabled = runningOperation == null && canUpload &&
+                        token.isNotBlank() && commitMessage.isNotBlank(),
+                    modifier = Modifier.fillMaxWidth(),
+                    contentPadding = PaddingValues(16.dp),
+                ) {
+                    Text("↑ SUBIR")
+                }
             }
             DownloadResultPanel(downloadResult)
+            UploadResultPanel(uploadResult)
 
             Text("Herramientas de diagnóstico", style = MaterialTheme.typography.headlineSmall)
             Text("Prueba local", style = MaterialTheme.typography.titleLarge)
@@ -273,19 +349,7 @@ private fun DiagnosticScreen(
 
             Text("Push HTTPS autenticado", style = MaterialTheme.typography.titleLarge)
             Text("Repositorio desechable: robdor80/Robgit.pruebas")
-            OutlinedTextField(
-                value = token,
-                onValueChange = { token = it },
-                label = { Text("GitHub Personal Access Token") },
-                visualTransformation = PasswordVisualTransformation(),
-                keyboardOptions = KeyboardOptions(
-                    keyboardType = KeyboardType.Password,
-                    autoCorrectEnabled = false,
-                ),
-                enabled = runningOperation == null,
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
+            Text("Usa el mismo Token GitHub introducido en la zona funcional.")
             Button(
                 onClick = {
                     val tokenForRun = token.toCharArray()
@@ -384,6 +448,31 @@ private fun DownloadResultPanel(result: DownloadResult?) {
     if (result.outcome == DownloadOutcome.SUCCESS) {
         Text("Commits descargados: ${result.commitsDownloaded}")
         Text("Working tree limpio: ${if (result.workingTreeClean) "sí" else "no"}")
+    }
+    result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+}
+
+@Composable
+private fun UploadResultPanel(result: UploadResult?) {
+    result ?: return
+    val prefix = when (result.outcome) {
+        UploadOutcome.SUCCESS -> "✓"
+        UploadOutcome.NOTHING_TO_UPLOAD -> "="
+        else -> "⚠"
+    }
+    Text("$prefix ${result.message}")
+    Text("Resultado: ${result.outcome}")
+    if (result.previousHead != null || result.attemptedHead != null) {
+        Text(
+            "HEAD: ${result.previousHead?.take(7) ?: "desconocido"} → " +
+                (result.attemptedHead?.take(7) ?: "desconocido"),
+        )
+    }
+    if (result.commitCreated) {
+        Text("Commit local creado y conservado: sí")
+    }
+    if (result.outcome == UploadOutcome.SUCCESS) {
+        Text("Commits subidos: ${result.commitsUploaded}")
     }
     result.error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
 }

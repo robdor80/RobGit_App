@@ -5,11 +5,15 @@ import org.eclipse.jgit.api.MergeCommand
 import org.eclipse.jgit.api.MergeResult
 import org.eclipse.jgit.lib.Constants
 import org.eclipse.jgit.lib.ObjectId
+import org.eclipse.jgit.lib.PersonIdent
 import org.eclipse.jgit.lib.Repository
 import org.eclipse.jgit.revwalk.RevWalk
+import org.eclipse.jgit.transport.CredentialsProvider
 import org.eclipse.jgit.transport.URIish
+import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
 import java.io.File
 import java.time.Instant
+import java.util.Arrays
 
 private const val FUNCTIONAL_REPOSITORY_URL = "https://github.com/robdor80/Robgit.pruebas.git"
 
@@ -87,9 +91,35 @@ data class DownloadResult(
     val error: String? = null,
 )
 
+enum class UploadOutcome {
+    SUCCESS,
+    NOTHING_TO_UPLOAD,
+    BLOCKED_REMOTE_AHEAD,
+    BLOCKED_DIVERGED,
+    BLOCKED_CONFLICTS,
+    FETCH_ERROR,
+    AUTH_REQUIRED,
+    AUTH_FAILED,
+    PUSH_REJECTED_REMOTE_CHANGED,
+    PUSH_UNCERTAIN,
+    ERROR,
+}
+
+data class UploadResult(
+    val outcome: UploadOutcome,
+    val message: String,
+    val previousHead: String?,
+    val attemptedHead: String?,
+    val commitCreated: Boolean,
+    val commitsUploaded: Int,
+    val finalState: RepositoryStateSnapshot?,
+    val error: String? = null,
+)
+
 /** Prepares and reads the single persistent functional repository used at this stage. */
 class RepositoryStateService(
     private val repositoryUrl: String = FUNCTIONAL_REPOSITORY_URL,
+    private val remoteGateway: RepositoryRemoteGateway = JGitRepositoryRemoteGateway(),
 ) {
     fun isPrepared(repositoryDirectory: File): Boolean = try {
         File(repositoryDirectory, ".git").isDirectory &&
@@ -296,13 +326,484 @@ class RepositoryStateService(
         }
     }
 
-    private fun validateFunctionalRepository(git: Git) {
+    /** Revalidates origin, commits pending files once, and performs one normal non-forced push. */
+    fun uploadSafely(
+        repositoryDirectory: File,
+        token: CharArray,
+        commitMessage: String,
+    ): UploadResult {
+        val checkedAt = Instant.now()
+        var credentials: UsernamePasswordCredentialsProvider? = null
+        var previousHead: ObjectId? = null
+        var attemptedHead: ObjectId? = null
+        var commitCreated = false
+        try {
+            check(File(repositoryDirectory, ".git").isDirectory) {
+                "El repositorio persistente todavía no está preparado."
+            }
+            Git.open(repositoryDirectory).use { git ->
+                validateRepositoryIdentity(git)
+                val statusBeforeFetch = git.status().call()
+                if (statusBeforeFetch.conflicting.isNotEmpty()) {
+                    return uploadResult(
+                        outcome = UploadOutcome.BLOCKED_CONFLICTS,
+                        message = "Hay conflictos locales. No se preparó ningún commit ni se intentó subir.",
+                        git = git,
+                    )
+                }
+                check(git.repository.repositoryState == org.eclipse.jgit.lib.RepositoryState.SAFE) {
+                    "El repositorio tiene una operación Git incompleta (${git.repository.repositoryState})."
+                }
+                if (token.isEmpty()) {
+                    return uploadResult(
+                        outcome = UploadOutcome.AUTH_REQUIRED,
+                        message = "Introduce un token de GitHub para subir.",
+                        git = git,
+                    )
+                }
+                val normalizedMessage = commitMessage.trim()
+                if (normalizedMessage.isEmpty()) {
+                    return uploadResult(
+                        outcome = UploadOutcome.ERROR,
+                        message = "El mensaje del cambio no puede estar vacío.",
+                        git = git,
+                    )
+                }
+
+                credentials = UsernamePasswordCredentialsProvider("x-access-token", token)
+                try {
+                    remoteGateway.fetch(git, credentials)
+                } catch (failure: Throwable) {
+                    if (failure !is Exception && failure !is LinkageError) throw failure
+                    return if (isAuthenticationFailure(failure)) {
+                        uploadResult(
+                            outcome = UploadOutcome.AUTH_FAILED,
+                            message = "GitHub rechazó las credenciales. No se modificó el trabajo local.",
+                            git = git,
+                        )
+                    } else {
+                        uploadResult(
+                            outcome = UploadOutcome.FETCH_ERROR,
+                            message = "No se pudo comprobar GitHub. No se preparó ningún commit ni se intentó subir.",
+                            git = git,
+                            error = safeFailure("Fetch inicial", failure),
+                        )
+                    }
+                }
+
+                val initialState = inspectFetchedState(git, checkedAt)
+                when (initialState.relation) {
+                    CommitRelation.REMOTE_AHEAD -> return uploadResult(
+                        outcome = UploadOutcome.BLOCKED_REMOTE_AHEAD,
+                        message = "GitHub tiene cambios nuevos. Descárgalos antes de subir.",
+                        git = git,
+                        finalState = initialState,
+                    )
+                    CommitRelation.DIVERGED -> return uploadResult(
+                        outcome = UploadOutcome.BLOCKED_DIVERGED,
+                        message = "El repositorio local y GitHub han divergido. No se realizó ninguna mutación.",
+                        git = git,
+                        finalState = initialState,
+                    )
+                    CommitRelation.UNDETERMINED -> return uploadResult(
+                        outcome = UploadOutcome.ERROR,
+                        message = "No se puede determinar con seguridad la relación con GitHub.",
+                        git = git,
+                        finalState = initialState,
+                    )
+                    CommitRelation.SYNCHRONIZED,
+                    CommitRelation.LOCAL_AHEAD,
+                    -> Unit
+                }
+                if (initialState.changes.conflictingFiles.isNotEmpty()) {
+                    return uploadResult(
+                        outcome = UploadOutcome.BLOCKED_CONFLICTS,
+                        message = "Hay conflictos locales. No se preparó ningún commit ni se intentó subir.",
+                        git = git,
+                        finalState = initialState,
+                    )
+                }
+
+                previousHead = git.repository.resolve(Constants.HEAD)
+                val baselineRemote = git.repository.resolve("refs/remotes/origin/main")
+                check(previousHead != null && baselineRemote != null)
+
+                if (initialState.changes.hasChanges) {
+                    stageAllRelevantChanges(git)
+                    val staged = git.status().call()
+                    check(
+                        staged.added.isNotEmpty() || staged.changed.isNotEmpty() ||
+                            staged.removed.isNotEmpty()
+                    ) { "No hay cambios relevantes preparados para crear el commit." }
+                    val identity = commitIdentity(git.repository)
+                    val commit = git.commit()
+                        .setMessage(normalizedMessage)
+                        .setAuthor(identity)
+                        .setCommitter(identity)
+                        .call()
+                    commitCreated = true
+                    attemptedHead = commit.id
+                    check(git.repository.resolve(Constants.HEAD) == commit.id)
+                    check(git.status().call().isClean) {
+                        "El working tree no quedó limpio después de crear el commit."
+                    }
+                } else {
+                    attemptedHead = previousHead
+                }
+
+                if (attemptedHead == baselineRemote) {
+                    return uploadResult(
+                        outcome = UploadOutcome.NOTHING_TO_UPLOAD,
+                        message = "No hay cambios ni commits pendientes de subir.",
+                        git = git,
+                        previousHead = previousHead,
+                        attemptedHead = attemptedHead,
+                    )
+                }
+
+                try {
+                    remoteGateway.fetch(git, credentials)
+                } catch (failure: Throwable) {
+                    if (failure !is Exception && failure !is LinkageError) throw failure
+                    val outcome = if (isAuthenticationFailure(failure)) {
+                        UploadOutcome.AUTH_FAILED
+                    } else {
+                        UploadOutcome.FETCH_ERROR
+                    }
+                    return uploadResult(
+                        outcome = outcome,
+                        message = savedWorkMessage(
+                            if (outcome == UploadOutcome.AUTH_FAILED) {
+                                "GitHub rechazó las credenciales antes del push."
+                            } else {
+                                "No se pudo volver a comprobar GitHub antes del push."
+                            },
+                            commitCreated,
+                        ),
+                        git = git,
+                        previousHead = previousHead,
+                        attemptedHead = attemptedHead,
+                        commitCreated = commitCreated,
+                        error = if (outcome == UploadOutcome.FETCH_ERROR) {
+                            safeFailure("Segundo fetch", failure)
+                        } else {
+                            null
+                        },
+                    )
+                }
+
+                val remoteBeforePush = git.repository.resolve("refs/remotes/origin/main")
+                check(remoteBeforePush != null)
+                if (remoteBeforePush != baselineRemote) {
+                    val latest = inspectFetchedState(git, Instant.now())
+                    return uploadResult(
+                        outcome = UploadOutcome.PUSH_REJECTED_REMOTE_CHANGED,
+                        message = savedWorkMessage(
+                            "GitHub cambió mientras se preparaba la subida. No se intentó hacer push.",
+                            commitCreated,
+                        ),
+                        git = git,
+                        previousHead = previousHead,
+                        attemptedHead = attemptedHead,
+                        commitCreated = commitCreated,
+                        finalState = latest,
+                    )
+                }
+
+                val relationBeforePush = calculateRelation(
+                    git.repository,
+                    requireNotNull(attemptedHead),
+                    remoteBeforePush,
+                )
+                check(
+                    relationBeforePush.relation == CommitRelation.LOCAL_AHEAD &&
+                        relationBeforePush.ahead > 0 && relationBeforePush.behind == 0
+                ) { "El estado dejó de ser un avance local seguro antes del push." }
+                val commitsToUpload = relationBeforePush.ahead
+
+                val pushResult = try {
+                    remoteGateway.pushMain(git, requireNotNull(credentials))
+                } catch (failure: Throwable) {
+                    if (failure !is Exception && failure !is LinkageError) throw failure
+                    if (isAuthenticationFailure(failure)) {
+                        return uploadResult(
+                            outcome = UploadOutcome.AUTH_FAILED,
+                            message = savedWorkMessage(
+                                "GitHub rechazó las credenciales durante el push.",
+                                commitCreated,
+                            ),
+                            git = git,
+                            previousHead = previousHead,
+                            attemptedHead = attemptedHead,
+                            commitCreated = commitCreated,
+                        )
+                    }
+                    return verifyAmbiguousPushOnce(
+                        git = git,
+                        credentials = requireNotNull(credentials),
+                        previousHead = requireNotNull(previousHead),
+                        attemptedHead = requireNotNull(attemptedHead),
+                        commitCreated = commitCreated,
+                        commitsToUpload = commitsToUpload,
+                        failure = failure,
+                    )
+                }
+
+                return when (pushResult.outcome) {
+                    PushTransportOutcome.ACCEPTED -> finalizeAcceptedPush(
+                        git = git,
+                        credentials = requireNotNull(credentials),
+                        previousHead = requireNotNull(previousHead),
+                        attemptedHead = requireNotNull(attemptedHead),
+                        commitCreated = commitCreated,
+                        commitsToUpload = commitsToUpload,
+                    )
+                    PushTransportOutcome.REJECTED_REMOTE_CHANGED -> uploadResult(
+                        outcome = UploadOutcome.PUSH_REJECTED_REMOTE_CHANGED,
+                        message = savedWorkMessage(
+                            "GitHub cambió y rechazó el push normal. No se forzó la subida.",
+                            commitCreated,
+                        ),
+                        git = git,
+                        previousHead = previousHead,
+                        attemptedHead = attemptedHead,
+                        commitCreated = commitCreated,
+                    )
+                    PushTransportOutcome.AUTH_FAILED -> uploadResult(
+                        outcome = UploadOutcome.AUTH_FAILED,
+                        message = savedWorkMessage(
+                            "GitHub rechazó las credenciales durante el push.",
+                            commitCreated,
+                        ),
+                        git = git,
+                        previousHead = previousHead,
+                        attemptedHead = attemptedHead,
+                        commitCreated = commitCreated,
+                    )
+                    PushTransportOutcome.AMBIGUOUS -> verifyAmbiguousPushOnce(
+                        git = git,
+                        credentials = requireNotNull(credentials),
+                        previousHead = requireNotNull(previousHead),
+                        attemptedHead = requireNotNull(attemptedHead),
+                        commitCreated = commitCreated,
+                        commitsToUpload = commitsToUpload,
+                    )
+                    PushTransportOutcome.ERROR -> uploadResult(
+                        outcome = UploadOutcome.ERROR,
+                        message = savedWorkMessage(
+                            "GitHub devolvió un resultado de push no aceptado.",
+                            commitCreated,
+                        ),
+                        git = git,
+                        previousHead = previousHead,
+                        attemptedHead = attemptedHead,
+                        commitCreated = commitCreated,
+                        error = pushResult.detail,
+                    )
+                }
+            }
+        } catch (failure: Throwable) {
+            if (failure !is Exception && failure !is LinkageError) throw failure
+            return UploadResult(
+                outcome = UploadOutcome.ERROR,
+                message = savedWorkMessage(
+                    "No se pudo completar SUBIR con seguridad.",
+                    commitCreated,
+                ),
+                previousHead = previousHead?.name,
+                attemptedHead = attemptedHead?.name,
+                commitCreated = commitCreated,
+                commitsUploaded = 0,
+                finalState = null,
+                error = safeFailure("SUBIR", failure),
+            )
+        } finally {
+            credentials?.clear()
+            Arrays.fill(token, '\u0000')
+        }
+    }
+
+    private fun stageAllRelevantChanges(git: Git) {
+        git.add().addFilepattern(".").call()
+        git.add().setUpdate(true).addFilepattern(".").call()
+    }
+
+    private fun commitIdentity(repository: Repository): PersonIdent {
+        val configuredName = repository.config.getString("user", null, "name")?.trim()
+        val configuredEmail = repository.config.getString("user", null, "email")?.trim()
+        return if (!configuredName.isNullOrEmpty() &&
+            !configuredEmail.isNullOrEmpty() && "@" in configuredEmail
+        ) {
+            PersonIdent(configuredName, configuredEmail)
+        } else {
+            PersonIdent("RobGit Android", "robgit@localhost")
+        }
+    }
+
+    private fun verifyAmbiguousPushOnce(
+        git: Git,
+        credentials: CredentialsProvider,
+        previousHead: ObjectId,
+        attemptedHead: ObjectId,
+        commitCreated: Boolean,
+        commitsToUpload: Int,
+        failure: Throwable? = null,
+    ): UploadResult {
+        return try {
+            // This is the only remote query after an ambiguous push. Never retry the push.
+            remoteGateway.fetch(git, credentials)
+            val remoteHead = git.repository.resolve("refs/remotes/origin/main")
+            if (remoteHead == attemptedHead) {
+                val finalState = inspectFetchedState(git, Instant.now())
+                uploadResult(
+                    outcome = UploadOutcome.SUCCESS,
+                    message = "La subida quedó confirmada mediante una única comprobación posterior.",
+                    git = git,
+                    previousHead = previousHead,
+                    attemptedHead = attemptedHead,
+                    commitCreated = commitCreated,
+                    commitsUploaded = commitsToUpload,
+                    finalState = finalState,
+                )
+            } else {
+                uploadResult(
+                    outcome = UploadOutcome.PUSH_UNCERTAIN,
+                    message = savedWorkMessage(
+                        "No se pudo confirmar que GitHub apunte al commit intentado. No se repetirá el push.",
+                        commitCreated,
+                    ),
+                    git = git,
+                    previousHead = previousHead,
+                    attemptedHead = attemptedHead,
+                    commitCreated = commitCreated,
+                    finalState = inspectFetchedState(git, Instant.now()),
+                    error = failure?.let { safeFailure("Respuesta de push ambigua", it) },
+                )
+            }
+        } catch (verificationFailure: Throwable) {
+            if (verificationFailure !is Exception && verificationFailure !is LinkageError) {
+                throw verificationFailure
+            }
+            uploadResult(
+                outcome = UploadOutcome.PUSH_UNCERTAIN,
+                message = savedWorkMessage(
+                    "No se pudo confirmar si GitHub recibió el commit. No se repetirá el push.",
+                    commitCreated,
+                ),
+                git = git,
+                previousHead = previousHead,
+                attemptedHead = attemptedHead,
+                commitCreated = commitCreated,
+                error = safeFailure("Verificación única posterior al push", verificationFailure),
+            )
+        }
+    }
+
+    private fun finalizeAcceptedPush(
+        git: Git,
+        credentials: CredentialsProvider,
+        previousHead: ObjectId,
+        attemptedHead: ObjectId,
+        commitCreated: Boolean,
+        commitsToUpload: Int,
+    ): UploadResult {
+        return try {
+            remoteGateway.fetch(git, credentials)
+            val finalState = inspectFetchedState(git, Instant.now())
+            val finalRemote = git.repository.resolve("refs/remotes/origin/main")
+            check(finalRemote != null)
+            val attemptedIsPresent = finalRemote == attemptedHead ||
+                isMergedInto(git.repository, attemptedHead, finalRemote)
+            if (!attemptedIsPresent) {
+                uploadResult(
+                    outcome = UploadOutcome.PUSH_UNCERTAIN,
+                    message = savedWorkMessage(
+                        "El push respondió como aceptado, pero no se pudo verificar el commit en GitHub.",
+                        commitCreated,
+                    ),
+                    git = git,
+                    previousHead = previousHead,
+                    attemptedHead = attemptedHead,
+                    commitCreated = commitCreated,
+                    finalState = finalState,
+                )
+            } else {
+                val message = if (finalRemote == attemptedHead) {
+                    "Subida confirmada. El repositorio está sincronizado con GitHub."
+                } else {
+                    "Subida confirmada. GitHub volvió a avanzar después de recibir el commit."
+                }
+                uploadResult(
+                    outcome = UploadOutcome.SUCCESS,
+                    message = message,
+                    git = git,
+                    previousHead = previousHead,
+                    attemptedHead = attemptedHead,
+                    commitCreated = commitCreated,
+                    commitsUploaded = commitsToUpload,
+                    finalState = finalState,
+                )
+            }
+        } catch (failure: Throwable) {
+            if (failure !is Exception && failure !is LinkageError) throw failure
+            uploadResult(
+                outcome = UploadOutcome.SUCCESS,
+                message = "El servidor aceptó la subida, pero no se pudo actualizar el estado final.",
+                git = git,
+                previousHead = previousHead,
+                attemptedHead = attemptedHead,
+                commitCreated = commitCreated,
+                commitsUploaded = commitsToUpload,
+                error = safeFailure("Verificación final", failure),
+            )
+        }
+    }
+
+    private fun uploadResult(
+        outcome: UploadOutcome,
+        message: String,
+        git: Git,
+        previousHead: ObjectId? = git.repository.resolve(Constants.HEAD),
+        attemptedHead: ObjectId? = git.repository.resolve(Constants.HEAD),
+        commitCreated: Boolean = false,
+        commitsUploaded: Int = 0,
+        finalState: RepositoryStateSnapshot? = null,
+        error: String? = null,
+    ) = UploadResult(
+        outcome = outcome,
+        message = message,
+        previousHead = previousHead?.name,
+        attemptedHead = attemptedHead?.name,
+        commitCreated = commitCreated,
+        commitsUploaded = commitsUploaded,
+        finalState = finalState,
+        error = error,
+    )
+
+    private fun savedWorkMessage(message: String, commitCreated: Boolean): String =
+        if (commitCreated) {
+            "$message El trabajo está guardado localmente; no se ha perdido."
+        } else {
+            message
+        }
+
+    private fun isAuthenticationFailure(failure: Throwable): Boolean =
+        generateSequence(failure) { it.cause }.take(5).any {
+            val text = "${it.javaClass.name} ${it.message.orEmpty()}".lowercase()
+            "not authorized" in text || "authentication" in text ||
+                "unauthorized" in text || "401" in text || "403" in text
+        }
+
+    /** Returns diagnostic classes only; exception messages can contain credential material. */
+    private fun safeFailure(stage: String, failure: Throwable): String =
+        "$stage — " + generateSequence(failure) { it.cause }
+            .take(5)
+            .joinToString(" ← ") { it.javaClass.name }
+
+    private fun validateRepositoryIdentity(git: Git) {
         val repository = git.repository
         check(!repository.isBare && repository.objectDatabase.exists()) {
             "El repositorio persistente no es válido."
-        }
-        check(repository.repositoryState == org.eclipse.jgit.lib.RepositoryState.SAFE) {
-            "El repositorio tiene una operación Git incompleta (${repository.repositoryState})."
         }
         check(repository.branch == "main") {
             "Se esperaba la rama main, se obtuvo ${repository.branch}."
@@ -313,12 +814,16 @@ class RepositoryStateService(
         }
     }
 
+    private fun validateFunctionalRepository(git: Git) {
+        validateRepositoryIdentity(git)
+        val repository = git.repository
+        check(repository.repositoryState == org.eclipse.jgit.lib.RepositoryState.SAFE) {
+            "El repositorio tiene una operación Git incompleta (${repository.repositoryState})."
+        }
+    }
+
     private fun fetchOrigin(git: Git) {
-        git.fetch()
-            .setRemote("origin")
-            .setCredentialsProvider(null)
-            .setTimeout(60)
-            .call()
+        remoteGateway.fetch(git, null)
     }
 
     private fun inspectFetchedState(git: Git, checkedAt: Instant): RepositoryStateSnapshot {
