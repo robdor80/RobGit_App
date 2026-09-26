@@ -23,6 +23,11 @@ interface RepositoryRemoteGateway {
     fun fetch(git: Git, credentials: CredentialsProvider?)
 
     fun pushMain(git: Git, credentials: CredentialsProvider): PushTransportResult
+
+    fun pushBranch(git: Git, credentials: CredentialsProvider, branch: String): PushTransportResult {
+        require(branch == "main") { "El gateway no admite esta rama." }
+        return pushMain(git, credentials)
+    }
 }
 
 class JGitRepositoryRemoteGateway : RepositoryRemoteGateway {
@@ -37,17 +42,24 @@ class JGitRepositoryRemoteGateway : RepositoryRemoteGateway {
     override fun pushMain(
         git: Git,
         credentials: CredentialsProvider,
+    ): PushTransportResult = pushBranch(git, credentials, "main")
+
+    override fun pushBranch(
+        git: Git,
+        credentials: CredentialsProvider,
+        branch: String,
     ): PushTransportResult {
+        val ref = "refs/heads/$branch"
         val results = git.push()
             .setRemote("origin")
-            .setRefSpecs(RefSpec("refs/heads/main:refs/heads/main"))
+            .setRefSpecs(RefSpec("$ref:$ref"))
             .setForce(false)
             .setCredentialsProvider(credentials)
             .setTimeout(60)
             .call()
             .toList()
         val updates = results.flatMap { it.remoteUpdates }
-            .filter { it.remoteName == "refs/heads/main" }
+            .filter { it.remoteName == ref }
         if (updates.isEmpty()) {
             return PushTransportResult(PushTransportOutcome.AMBIGUOUS)
         }

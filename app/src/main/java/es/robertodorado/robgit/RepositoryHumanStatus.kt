@@ -14,6 +14,10 @@ data class RepositoryHumanStatus(
 
 /** The single translation layer between technical Git state and the main screen. */
 object RepositoryStatusPresenter {
+    val noRepositories = RepositoryHumanStatus(
+        title = "No tienes repositorios configurados.",
+        explanation = "Añade un repositorio de GitHub para empezar.",
+    )
     val analyzing = RepositoryHumanStatus(
         title = "Comprobando el repositorio…",
         explanation = "RobGit está comprobando este dispositivo y GitHub.",
@@ -25,6 +29,17 @@ object RepositoryStatusPresenter {
     )
 
     fun present(state: RepositoryStateSnapshot): RepositoryHumanStatus {
+        if (state.authenticationRequired) return authorizationForReading()
+        if (state.type == RepositoryStateType.ERROR &&
+            (state.error.orEmpty().contains("no existe después del fetch", ignoreCase = true) ||
+                state.error.orEmpty().contains("Se esperaba la rama", ignoreCase = true))
+        ) {
+            return RepositoryHumanStatus(
+                "La rama configurada no está disponible.",
+                "Comprueba la rama de este repositorio en GitHub.",
+                blocked = true,
+            )
+        }
         if (state.changes.conflictingFiles.isNotEmpty()) {
             return RepositoryHumanStatus(
                 "Hay conflictos pendientes.",
@@ -105,6 +120,12 @@ object RepositoryStatusPresenter {
         recommendedAction = RepositoryAction.PUSH,
     )
 
+    fun authorizationForReading() = RepositoryHumanStatus(
+        "Para comprobar este repositorio necesitas autorizar RobGit en GitHub.",
+        "Introduce tu token de GitHub para continuar.",
+        blocked = true,
+    )
+
     fun authFailed() = RepositoryHumanStatus(
         "GitHub rechazó las credenciales.",
         "El token no es válido, ha caducado o no tiene los permisos necesarios.",
@@ -148,7 +169,8 @@ object RepositoryStatusPresenter {
             "RobGit no realizará ninguna operación automática para evitar perder trabajo.",
             blocked = true,
         )
-        DownloadOutcome.FETCH_ERROR -> fetchError()
+        DownloadOutcome.FETCH_ERROR -> if (result.finalState?.authenticationRequired == true)
+            authorizationForReading() else fetchError()
         DownloadOutcome.ERROR -> genericError()
     }
 
@@ -185,7 +207,8 @@ object RepositoryStatusPresenter {
         SynchronizationOutcome.NOTHING_TO_DO -> RepositoryHumanStatus(
             "Todo está al día.", "No era necesario hacer nada.",
         )
-        SynchronizationOutcome.AUTH_REQUIRED -> authRequired()
+        SynchronizationOutcome.AUTH_REQUIRED -> if (result.finalState?.authenticationRequired == true)
+            authorizationForReading() else authRequired()
         SynchronizationOutcome.AUTH_FAILED -> authFailed()
         SynchronizationOutcome.PUSH_UNCERTAIN -> pushUncertain()
         SynchronizationOutcome.BLOCKED_CONFLICTS -> conflicts()

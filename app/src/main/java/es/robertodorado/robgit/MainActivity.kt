@@ -58,12 +58,11 @@ class MainActivity : ComponentActivity() {
         requestedOrientation = if (tablet) ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         super.onCreate(savedInstanceState)
         val diagnosticRoot = File(filesDir, "diagnostics")
-        val functionalRepository = File(filesDir, "repos/robgit-pruebas")
+        val registry = RepositoryRegistry(File(filesDir, "repositories.properties"), File(filesDir, "repos"))
         setContent {
             RobGitTheme {
                 RobGitScreen(
-                    diagnosticRoot, remember { GitRepositoryService() }, remember { RepositoryStateService() },
-                    functionalRepository, foregroundReturn,
+                    diagnosticRoot, remember { GitRepositoryService() }, registry, foregroundReturn,
                 )
             }
         }
@@ -80,16 +79,22 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class AuthPurpose { PUSH, SYNCHRONIZE, DIAGNOSTIC }
+private enum class AuthPurpose { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, DIAGNOSTIC }
 
 @Composable
 private fun RobGitScreen(
     diagnosticRoot: File,
     gitService: GitRepositoryService,
-    repositoryService: RepositoryStateService,
-    functionalRepository: File,
+    registry: RepositoryRegistry,
     foregroundReturn: Int,
 ) {
+    var catalog by remember { mutableStateOf<RepositoryCatalog?>(null) }
+    var uiRepositoryId by rememberSaveable { mutableStateOf<String?>(null) }
+    val selectedRepository = catalog?.selected
+    val functionalRepository = selectedRepository?.let(registry::directoryFor)
+    val repositoryService = remember(selectedRepository?.id) {
+        selectedRepository?.let { RepositoryStateService(repositoryUrl = it.remoteUrl, branch = it.branch) }
+    }
     var repositoryPrepared by rememberSaveable { mutableStateOf<Boolean?>(null) }
     var repositoryState by rememberSaveable(stateSaver = repositoryStateSaver) { mutableStateOf<RepositoryStateSnapshot?>(null) }
     var lastOperation by rememberSaveable(stateSaver = lastOperationSaver) { mutableStateOf<RestoredOperation?>(null) }
@@ -104,53 +109,140 @@ private fun RobGitScreen(
     var localDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
     var pushDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
+    var showAddRepository by remember { mutableStateOf(false) }
+    var addError by remember { mutableStateOf<String?>(null) }
+    var pendingRemoval by remember { mutableStateOf<RepositoryConfig?>(null) }
+    var preparedRepositories by remember { mutableStateOf<Map<String, Boolean>>(emptyMap()) }
     val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        val loaded = withContext(Dispatchers.IO) { registry.load() }
+        if (repositorySelectionNeedsReset(uiRepositoryId, loaded.selectedRepositoryId)) {
+            repositoryPrepared = null
+            repositoryState = null
+            lastOperation = null
+            noticeTitle = null
+            noticeBody = null
+            noticeRecommendation = null
+        }
+        uiRepositoryId = loaded.selectedRepositoryId
+        catalog = loaded
+    }
 
     fun clearNotice() { noticeTitle = null; noticeBody = null; noticeRecommendation = null }
     fun setNotice(title: String, body: String, recommendation: String? = null) {
         noticeTitle = title; noticeBody = body; noticeRecommendation = recommendation
     }
-    fun analyze() {
+    fun clearRepositoryUi() {
+        repositoryPrepared = null
+        repositoryState = null
+        lastOperation = null
+        clearNotice()
+    }
+    fun selectRepository(id: String) {
+        if (!repositorySelectorEnabled(runningOperation) || selectedRepository?.id == id) return
+        runningOperation = "seleccionando"
+        scope.launch {
+            try {
+                val next = withContext(Dispatchers.IO) { registry.select(id) }
+                clearRepositoryUi()
+                uiRepositoryId = next.selectedRepositoryId
+                runningOperation = null
+                catalog = next
+            } catch (failure: Exception) {
+                runningOperation = null
+                setNotice("No se pudo cambiar de repositorio.", failure.message.orEmpty())
+            }
+        }
+    }
+    fun addRepository(name: String, url: String, branch: String) {
+        if (runningOperation != null) return
+        runningOperation = "añadiendo"
+        addError = null
+        scope.launch {
+            try {
+                val next = withContext(Dispatchers.IO) { registry.add(name, url, branch) }
+                clearRepositoryUi()
+                uiRepositoryId = next.selectedRepositoryId
+                showAddRepository = false
+                runningOperation = null
+                catalog = next
+            } catch (failure: Exception) {
+                addError = failure.message ?: "No se pudo añadir el repositorio."
+                runningOperation = null
+            }
+        }
+    }
+    fun analyze(token: CharArray = charArrayOf()) {
+        val suppliedToken = token.isNotEmpty()
+        val directory = functionalRepository ?: return
+        val service = repositoryService ?: return
         if (runningOperation != null || repositoryPrepared != true) return
         runningOperation = "analizando"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { repositoryService.refreshState(functionalRepository) }
+                val result = withContext(Dispatchers.IO) { service.refreshState(directory, token) }
                 repositoryState = result
                 lastOperation = RestoredOperation("ANALIZAR AHORA", result.type.name, result.message, result.error)
-            } finally { runningOperation = null }
+                if (result.authenticationRequired) {
+                    if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
+                    else authPurpose = AuthPurpose.ANALYZE
+                }
+            } finally { token.fill('\u0000'); runningOperation = null }
         }
     }
-    fun prepareRepository() {
+    fun prepareRepository(token: CharArray = charArrayOf()) {
+        val suppliedToken = token.isNotEmpty()
+        val directory = functionalRepository ?: return
+        val service = repositoryService ?: return
         if (runningOperation != null) return
         runningOperation = "preparando"; clearNotice()
         scope.launch {
+            val refreshToken = token.copyOf()
             try {
-                val result = withContext(Dispatchers.IO) { repositoryService.prepare(functionalRepository) }
+                val result = withContext(Dispatchers.IO) { service.prepare(directory, token) }
                 repositoryPrepared = result.success
                 lastOperation = RestoredOperation("PREPARAR REPOSITORIO", if (result.success) "OK" else "ERROR", result.message, result.error)
-                if (result.success) repositoryState = withContext(Dispatchers.IO) { repositoryService.refreshState(functionalRepository) }
-                else setNotice("No se ha podido preparar el repositorio.", "Tus archivos están protegidos.")
-            } finally { runningOperation = null }
+                if (result.success) {
+                    repositoryState = withContext(Dispatchers.IO) { service.refreshState(directory, refreshToken) }
+                    if (repositoryState?.authenticationRequired == true) {
+                        if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
+                        else authPurpose = AuthPurpose.ANALYZE
+                    }
+                }
+                else {
+                    setNotice(result.message, if (result.authenticationRequired) "Introduce tu token de GitHub para continuar." else "Tus archivos locales están protegidos.")
+                    if (result.authenticationRequired && !suppliedToken) authPurpose = AuthPurpose.PREPARE
+                }
+            } finally { token.fill('\u0000'); refreshToken.fill('\u0000'); runningOperation = null }
         }
     }
-    fun pull() {
+    fun pull(token: CharArray = charArrayOf()) {
+        val suppliedToken = token.isNotEmpty()
+        val directory = functionalRepository ?: return
+        val service = repositoryService ?: return
         if (runningOperation != null) return
         runningOperation = "PULL"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { repositoryService.downloadFastForward(functionalRepository) }
+                val result = withContext(Dispatchers.IO) { service.downloadFastForward(directory, token) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("PULL", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
-            } finally { runningOperation = null }
+                if (result.finalState?.authenticationRequired == true) {
+                    if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
+                    else authPurpose = AuthPurpose.PULL
+                }
+            } finally { token.fill('\u0000'); runningOperation = null }
         }
     }
     fun upload(token: CharArray, commitMessage: String) {
+        val directory = functionalRepository ?: return
+        val service = repositoryService ?: return
         runningOperation = "PUSH"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { repositoryService.uploadSafely(functionalRepository, token, commitMessage) }
+                val result = withContext(Dispatchers.IO) { service.uploadSafely(directory, token, commitMessage) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("PUSH", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
@@ -159,32 +251,43 @@ private fun RobGitScreen(
         }
     }
     fun synchronize(token: CharArray = charArrayOf(), commitMessage: String = "Cambios desde RobGit") {
+        val suppliedToken = token.isNotEmpty()
+        val directory = functionalRepository ?: return
+        val service = repositoryService ?: return
         runningOperation = "SINCRONIZAR"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { repositoryService.synchronizeSafely(functionalRepository, token, commitMessage) }
+                val result = withContext(Dispatchers.IO) { service.synchronizeSafely(directory, token, commitMessage) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("SINCRONIZAR", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
-                if (result.outcome == SynchronizationOutcome.AUTH_REQUIRED) authPurpose = AuthPurpose.SYNCHRONIZE
+                if (result.outcome == SynchronizationOutcome.AUTH_REQUIRED) {
+                    if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
+                    else authPurpose = AuthPurpose.SYNCHRONIZE
+                }
             } finally { token.fill('\u0000'); runningOperation = null }
         }
     }
 
-    LaunchedEffect(functionalRepository.absolutePath) {
-        if (repositoryPrepared == null) {
-            val prepared = withContext(Dispatchers.IO) { repositoryService.isPrepared(functionalRepository) }
-            repositoryPrepared = prepared
-            if (prepared) {
-                runningOperation = "analizando"
-                try { repositoryState = withContext(Dispatchers.IO) { repositoryService.refreshState(functionalRepository) } }
-                finally { runningOperation = null }
-            }
+    LaunchedEffect(selectedRepository?.id) {
+        val directory = functionalRepository
+        val service = repositoryService
+        if (directory != null && service != null && repositoryPrepared == null) {
+            runningOperation = "analizando"
+            try {
+                val prepared = withContext(Dispatchers.IO) { service.isPrepared(directory) }
+                repositoryPrepared = prepared
+                if (prepared) {
+                    repositoryState = withContext(Dispatchers.IO) { service.refreshState(directory) }
+                    if (repositoryState?.authenticationRequired == true) authPurpose = AuthPurpose.ANALYZE
+                }
+            } finally { runningOperation = null }
         }
     }
     LaunchedEffect(foregroundReturn) { if (foregroundReturn > 0 && repositoryPrepared == true) analyze() }
 
     val baseStatus = when {
+        catalog != null && selectedRepository == null -> RepositoryStatusPresenter.noRepositories
         repositoryPrepared == false -> RepositoryStatusPresenter.notPrepared
         repositoryState != null -> RepositoryStatusPresenter.present(requireNotNull(repositoryState))
         else -> RepositoryStatusPresenter.analyzing
@@ -202,24 +305,24 @@ private fun RobGitScreen(
             val outerPadding = if (tablet) RobGitDimens.TabletPadding else RobGitDimens.PhonePadding
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(outerPadding), horizontalAlignment = Alignment.CenterHorizontally) {
                 Column(Modifier.fillMaxWidth().widthIn(max = RobGitDimens.ContentMax)) {
-                    RobGitHeader(::analyze, { showTechnical = true }, { showSettings = true })
+                    RobGitHeader({ analyze() }, { showTechnical = true }, { showSettings = true })
                     Spacer(Modifier.height(18.dp))
                     if (landscapeTablet) {
                         Row(horizontalArrangement = Arrangement.spacedBy(28.dp), modifier = Modifier.fillMaxWidth()) {
                             Column(Modifier.weight(1.15f)) {
-                                RepositorySelector(); Spacer(Modifier.height(22.dp))
-                                HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, ::prepareRepository)
+                                RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
+                                HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true })
                             }
-                            ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, ::pull,
+                            ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, { pull() },
                                 { authPurpose = AuthPurpose.PUSH },
                                 { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
                                 { showAi = true }, Modifier.weight(.85f))
                         }
                     } else {
-                        RepositorySelector(); Spacer(Modifier.height(22.dp))
-                        HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, ::prepareRepository)
+                        RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
+                        HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true })
                         Spacer(Modifier.height(if (tablet) 28.dp else 22.dp))
-                        ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, ::pull,
+                        ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, { pull() },
                             { authPurpose = AuthPurpose.PUSH },
                             { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
                             { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp))
@@ -229,9 +332,53 @@ private fun RobGitScreen(
         }
     }
 
-    if (showTechnical) TechnicalDetailsDialog(repositoryState, lastOperation) { showTechnical = false }
+    LaunchedEffect(showSettings, catalog) {
+        if (showSettings) {
+            preparedRepositories = withContext(Dispatchers.IO) {
+                catalog?.repositories?.associate { config ->
+                    config.id to RepositoryStateService(repositoryUrl = config.remoteUrl, branch = config.branch)
+                        .isPrepared(registry.directoryFor(config))
+                }.orEmpty()
+            }
+        }
+    }
+    if (showTechnical) TechnicalDetailsDialog(selectedRepository, functionalRepository, repositoryState, lastOperation) { showTechnical = false }
     if (showAi) AiAssistantDialog { showAi = false }
-    if (showSettings) SettingsDialog(runningOperation, localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
+    if (showAddRepository) AddRepositoryDialog(
+        error = addError,
+        busy = runningOperation != null,
+        onDismiss = { showAddRepository = false; addError = null },
+        onAdd = ::addRepository,
+    )
+    pendingRemoval?.let { config ->
+        AlertDialog(
+            onDismissRequest = { pendingRemoval = null; showSettings = true },
+            title = { Text("Quitar de RobGit") },
+            text = { Text("Se quitará este repositorio de la lista de RobGit. Sus archivos locales no serán eliminados.") },
+            confirmButton = { TextButton(onClick = {
+                if (runningOperation != null) return@TextButton
+                runningOperation = "quitando"
+                scope.launch {
+                    try {
+                        val next = withContext(Dispatchers.IO) { registry.remove(config.id) }
+                        if (repositorySelectionNeedsReset(uiRepositoryId, next.selectedRepositoryId)) clearRepositoryUi()
+                        uiRepositoryId = next.selectedRepositoryId
+                        pendingRemoval = null
+                        runningOperation = null
+                        catalog = next
+                        showSettings = true
+                    } catch (failure: Exception) {
+                        pendingRemoval = null
+                        runningOperation = null
+                        setNotice("No se pudo quitar el repositorio.", failure.message.orEmpty())
+                    }
+                }
+            }) { Text("QUITAR DE ROBGIT") } },
+            dismissButton = { TextButton(onClick = { pendingRemoval = null; showSettings = true }) { Text("CANCELAR") } },
+        )
+    }
+    if (showSettings) SettingsDialog(runningOperation, catalog, preparedRepositories, localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
+        { config -> showSettings = false; pendingRemoval = config },
         {
             runningOperation = "diagnóstico local"; scope.launch {
                 localDiagnostic = withContext(Dispatchers.IO) { gitService.runLocalDiagnostic(File(diagnosticRoot, UUID.randomUUID().toString())) }
@@ -247,6 +394,9 @@ private fun RobGitScreen(
         AuthenticationDialog(purpose, { authPurpose = null }) { token, message ->
             authPurpose = null
             when (purpose) {
+                AuthPurpose.PREPARE -> prepareRepository(token)
+                AuthPurpose.ANALYZE -> analyze(token)
+                AuthPurpose.PULL -> pull(token)
                 AuthPurpose.PUSH -> upload(token, message)
                 AuthPurpose.SYNCHRONIZE -> synchronize(token, message)
                 AuthPurpose.DIAGNOSTIC -> {
@@ -281,22 +431,35 @@ private fun RobGitHeader(onAnalyze: () -> Unit, onTechnical: () -> Unit, onSetti
 }
 
 @Composable
-private fun RepositorySelector() {
+private fun RepositorySelector(
+    catalog: RepositoryCatalog?,
+    enabled: Boolean,
+    onSelect: (String) -> Unit,
+    onAdd: () -> Unit,
+) {
     var open by remember { mutableStateOf(false) }
     Box {
         TitledFrame(title = "REPOSITORIO", modifier = Modifier.fillMaxWidth()) {
             Box {
-                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable { open = true }.padding(horizontal = 18.dp, vertical = 15.dp)) {
-                    Text("Robgit.pruebas", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Text("▾", fontSize = 22.sp)
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().clickable(enabled = enabled) { open = true }.padding(horizontal = 18.dp, vertical = 15.dp)) {
+                    Text(catalog?.selected?.displayName ?: "Sin repositorios", modifier = Modifier.weight(1f), style = MaterialTheme.typography.titleMedium); Text("▾", fontSize = 22.sp)
                 }
-                DropdownMenu(open, { open = false }) { DropdownMenuItem({ Text("Robgit.pruebas") }, { open = false }) }
+                DropdownMenu(open && enabled, { open = false }) {
+                    catalog?.repositories?.forEach { config ->
+                        DropdownMenuItem(
+                            { Text("${if (config.id == catalog.selectedRepositoryId) "✓  " else ""}${config.displayName}") },
+                            { open = false; onSelect(config.id) },
+                        )
+                    }
+                    DropdownMenuItem({ Text("+ AÑADIR REPOSITORIO") }, { open = false; onAdd() })
+                }
             }
         }
     }
 }
 
 @Composable
-private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, notPrepared: Boolean, onPrepare: () -> Unit) {
+private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, notPrepared: Boolean, noRepositories: Boolean, onPrepare: () -> Unit, onAdd: () -> Unit) {
     TitledFrame(title = "ESTADO DEL REPOSITORIO", modifier = Modifier.fillMaxWidth(), contentColor = RobGitColors.PetroleumDark.copy(alpha = .48f)) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 20.dp)) {
             AnimatedContent(status.title, label = "estado") { Text(it, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
@@ -304,6 +467,7 @@ private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, no
             status.recommendation?.let { Spacer(Modifier.height(14.dp)); Text(it, color = if (status.blocked) RobGitColors.Warning else RobGitColors.Success, fontWeight = FontWeight.SemiBold) }
             if (running) { Spacer(Modifier.height(18.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = RobGitColors.Ice); Spacer(Modifier.width(12.dp)); Text("RobGit está trabajando…") } }
             if (notPrepared) { Spacer(Modifier.height(18.dp)); OutlinedButton(onPrepare, modifier = Modifier.fillMaxWidth()) { Text("PREPARAR REPOSITORIO") } }
+            if (noRepositories) { Spacer(Modifier.height(18.dp)); OutlinedButton(onAdd, modifier = Modifier.fillMaxWidth()) { Text("AÑADIR REPOSITORIO") } }
         }
     }
 }
@@ -427,9 +591,9 @@ private fun AuthenticationDialog(purpose: AuthPurpose, onDismiss: () -> Unit, on
         Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Text("El token solo se conserva en memoria durante esta operación.")
             OutlinedTextField(token, { token = it }, label = { Text("Token GitHub") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), singleLine = true)
-            if (purpose != AuthPurpose.DIAGNOSTIC) OutlinedTextField(message, { message = it }, label = { Text("Mensaje del cambio") }, singleLine = true)
+            if (purpose == AuthPurpose.PUSH || purpose == AuthPurpose.SYNCHRONIZE) OutlinedTextField(message, { message = it }, label = { Text("Mensaje del cambio") }, singleLine = true)
         }
-    }, confirmButton = { Button(enabled = token.isNotBlank() && (purpose == AuthPurpose.DIAGNOSTIC || message.isNotBlank()), onClick = { val secret = token.toCharArray(); token = ""; onConfirm(secret, message.trim()) }) { Text("CONTINUAR") } }, dismissButton = { TextButton(onClick = { token = ""; onDismiss() }) { Text("CANCELAR") } })
+    }, confirmButton = { Button(enabled = token.isNotBlank() && ((purpose != AuthPurpose.PUSH && purpose != AuthPurpose.SYNCHRONIZE) || message.isNotBlank()), onClick = { val secret = token.toCharArray(); token = ""; onConfirm(secret, message.trim()) }) { Text("CONTINUAR") } }, dismissButton = { TextButton(onClick = { token = ""; onDismiss() }) { Text("CANCELAR") } })
 }
 
 @Composable
@@ -446,11 +610,43 @@ private fun AiAssistantDialog(onDismiss: () -> Unit) {
 }
 
 @Composable
-private fun TechnicalDetailsDialog(state: RepositoryStateSnapshot?, operation: RestoredOperation?, onDismiss: () -> Unit) {
+private fun AddRepositoryDialog(
+    error: String?,
+    busy: Boolean,
+    onDismiss: () -> Unit,
+    onAdd: (String, String, String) -> Unit,
+) {
+    var name by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf("") }
+    var branch by remember { mutableStateOf("main") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Añadir repositorio") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(name, { name = it }, label = { Text("NOMBRE") }, placeholder = { Text("Nimroel RPG") }, singleLine = true)
+                OutlinedTextField(url, { url = it }, label = { Text("URL DE GITHUB") }, placeholder = { Text("https://github.com/usuario/repositorio") }, singleLine = true)
+                OutlinedTextField(branch, { branch = it }, label = { Text("RAMA") }, singleLine = true)
+                error?.let { Text(it, color = RobGitColors.Error) }
+            }
+        },
+        confirmButton = { Button(onClick = { onAdd(name, url, branch) }, enabled = !busy) { Text("AÑADIR") } },
+        dismissButton = { TextButton(onClick = onDismiss, enabled = !busy) { Text("CANCELAR") } },
+    )
+}
+
+@Composable
+private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, state: RepositoryStateSnapshot?, operation: RestoredOperation?, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Detalles técnicos") }, text = {
         Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            config?.let {
+                Text("Nombre: ${it.displayName}")
+                Text("URL: ${it.remoteUrl}")
+                Text("Rama configurada: ${it.branch}")
+                Text("Directorio local: ${directory?.absolutePath ?: "desconocido"}")
+            }
             if (state == null) Text("Todavía no hay un análisis disponible.") else {
-                Text("Rama: ${state.branch ?: "desconocida"}"); Text("HEAD: ${state.localHead ?: "desconocido"}"); Text("origin/main: ${state.remoteHead ?: "desconocido"}")
+                Text("Rama actual: ${state.branch ?: "desconocida"}"); Text("HEAD: ${state.localHead ?: "desconocido"}"); Text("origin/${config?.branch ?: "?"}: ${state.remoteHead ?: "desconocido"}")
                 Text("Ahead: ${state.ahead} · Behind: ${state.behind}"); Text("Working tree: ${if (state.changes.hasChanges) "con cambios" else "limpio"}")
                 TechnicalFiles("Nuevos", state.changes.newFiles); TechnicalFiles("Modificados", state.changes.modifiedFiles); TechnicalFiles("Eliminados", state.changes.deletedFiles); TechnicalFiles("Staged", state.changes.stagedFiles); TechnicalFiles("Conflictos", state.changes.conflictingFiles)
                 Text("Remoto actualizado: ${if (state.remoteStateIsFresh) "sí" else "no"}"); Text("Comprobado: ${state.checkedAt}"); state.error?.let { Text("Error: $it", color = RobGitColors.Error) }
@@ -463,10 +659,17 @@ private fun TechnicalDetailsDialog(state: RepositoryStateSnapshot?, operation: R
 @Composable private fun TechnicalFiles(label: String, files: Set<String>) { Text("$label (${files.size}): ${if (files.isEmpty()) "—" else files.joinToString()}") }
 
 @Composable
-private fun SettingsDialog(running: String?, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit) {
-    AlertDialog(onDismissRequest = onDismiss, title = { Text("Ajustes · Avanzado / Diagnóstico") }, text = {
+private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepared: Map<String, Boolean>, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onRemove: (RepositoryConfig) -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit) {
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("Ajustes") }, text = {
         Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Herramientas de laboratorio", color = RobGitColors.IceMuted)
+            Text("REPOSITORIOS", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
+            catalog?.repositories?.forEach { config ->
+                Text(config.displayName, fontWeight = FontWeight.Bold)
+                Text(config.remoteUrl, style = MaterialTheme.typography.bodySmall)
+                Text("Rama: ${config.branch} · ${if (prepared[config.id] == true) "preparado" else "no preparado"}", style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = { onRemove(config) }, enabled = running == null) { Text("QUITAR DE ROBGIT") }
+            }
+            Text("AVANZADO / DIAGNÓSTICO", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
             Button(onLocal, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PRUEBA LOCAL JGIT") }; DiagnosticSummary(localResult)
             Button(onRemote, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("CLONE HTTPS") }; DiagnosticSummary(remoteResult)
             Button(onAuthenticated, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PUSH HTTPS AUTENTICADO") }; DiagnosticSummary(pushResult)
@@ -481,9 +684,9 @@ internal val lastOperationSaver = Saver<RestoredOperation?, Any>(save = { it?.le
     val v = saved as? List<*> ?: return@Saver null
     RestoredOperation(v.getOrNull(0) as? String ?: return@Saver null, v.getOrNull(1) as? String ?: return@Saver null, v.getOrNull(2) as? String ?: return@Saver null, v.getOrNull(3) as? String)
 })
-internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(save = { s -> s?.let { listOf(it.type.name, it.relation.name, it.message, it.branch, it.localHead, it.remoteHead, it.ahead, it.behind, it.changes.newFiles.toList(), it.changes.modifiedFiles.toList(), it.changes.deletedFiles.toList(), it.changes.stagedFiles.toList(), it.changes.conflictingFiles.toList(), it.checkedAt.toString(), it.remoteStateIsFresh, it.error) } }, restore = { saved ->
+internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(save = { s -> s?.let { listOf(it.type.name, it.relation.name, it.message, it.branch, it.localHead, it.remoteHead, it.ahead, it.behind, it.changes.newFiles.toList(), it.changes.modifiedFiles.toList(), it.changes.deletedFiles.toList(), it.changes.stagedFiles.toList(), it.changes.conflictingFiles.toList(), it.checkedAt.toString(), it.remoteStateIsFresh, it.error, it.authenticationRequired) } }, restore = { saved ->
     val v = saved as? List<*> ?: return@Saver null
     fun str(i: Int) = v.getOrNull(i) as? String
     fun files(i: Int) = (v.getOrNull(i) as? List<*>)?.mapNotNull { it as? String }?.toSet() ?: emptySet()
-    RepositoryStateSnapshot(str(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() } ?: return@Saver null, str(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() } ?: return@Saver null, str(2) ?: return@Saver null, str(3), str(4), str(5), v.getOrNull(6) as? Int ?: return@Saver null, v.getOrNull(7) as? Int ?: return@Saver null, WorkingTreeChanges(files(8), files(9), files(10), files(11), files(12)), str(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() } ?: return@Saver null, v.getOrNull(14) as? Boolean ?: return@Saver null, str(15))
+    RepositoryStateSnapshot(str(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() } ?: return@Saver null, str(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() } ?: return@Saver null, str(2) ?: return@Saver null, str(3), str(4), str(5), v.getOrNull(6) as? Int ?: return@Saver null, v.getOrNull(7) as? Int ?: return@Saver null, WorkingTreeChanges(files(8), files(9), files(10), files(11), files(12)), str(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() } ?: return@Saver null, v.getOrNull(14) as? Boolean ?: return@Saver null, str(15), v.getOrNull(16) as? Boolean ?: false)
 })

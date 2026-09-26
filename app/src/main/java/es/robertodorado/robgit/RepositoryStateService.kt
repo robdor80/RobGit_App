@@ -12,10 +12,9 @@ import org.eclipse.jgit.transport.CredentialsProvider
 import org.eclipse.jgit.transport.URIish
 import org.eclipse.jgit.transport.UsernamePasswordCredentialsProvider
 import java.io.File
+import java.nio.file.Files
 import java.time.Instant
 import java.util.Arrays
-
-private const val FUNCTIONAL_REPOSITORY_URL = "https://github.com/robdor80/Robgit.pruebas.git"
 
 enum class RepositoryStateType {
     SYNCHRONIZED,
@@ -60,6 +59,7 @@ data class RepositoryStateSnapshot(
     val checkedAt: Instant,
     val remoteStateIsFresh: Boolean,
     val error: String? = null,
+    val authenticationRequired: Boolean = false,
 )
 
 data class RepositoryPreparationResult(
@@ -68,6 +68,7 @@ data class RepositoryPreparationResult(
     val cloned: Boolean,
     val message: String,
     val error: String? = null,
+    val authenticationRequired: Boolean = false,
 )
 
 enum class DownloadOutcome {
@@ -140,21 +141,26 @@ data class SynchronizationResult(
     val error: String? = null,
 )
 
-/** Prepares and reads the single persistent functional repository used at this stage. */
+/** Safe Git operations scoped to one configured remote and branch. */
 class RepositoryStateService(
-    private val repositoryUrl: String = FUNCTIONAL_REPOSITORY_URL,
+    private val repositoryUrl: String,
     private val remoteGateway: RepositoryRemoteGateway = JGitRepositoryRemoteGateway(),
+    private val branch: String = "main",
 ) {
+    private val remoteTrackingRef: String get() = "refs/remotes/origin/$branch"
+
     fun isPrepared(repositoryDirectory: File): Boolean = try {
         File(repositoryDirectory, ".git").isDirectory &&
             Git.open(repositoryDirectory).use { git ->
-                !git.repository.isBare && git.repository.objectDatabase.exists()
+                validateRepositoryIdentity(git)
+                git.repository.exactRef(remoteTrackingRef) != null
             }
     } catch (_: Exception) {
         false
     }
 
-    fun prepare(repositoryDirectory: File): RepositoryPreparationResult {
+    fun prepare(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryPreparationResult {
+        var temporaryDirectory: File? = null
         try {
             if (repositoryDirectory.exists()) {
                 check(File(repositoryDirectory, ".git").isDirectory) {
@@ -168,6 +174,9 @@ class RepositoryStateService(
                     check(origin != null && URIish(origin) == URIish(repositoryUrl)) {
                         "El repositorio existente utiliza otro remoto. No se modificará."
                     }
+                    check(git.repository.branch == branch && git.repository.exactRef(remoteTrackingRef) != null) {
+                        "La rama configurada no existe en el repositorio existente."
+                    }
                 }
                 return RepositoryPreparationResult(
                     success = true,
@@ -177,17 +186,28 @@ class RepositoryStateService(
                 )
             }
 
-            Git.cloneRepository()
-                .setURI(repositoryUrl)
-                .setDirectory(repositoryDirectory)
-                .setCredentialsProvider(null)
-                .setTimeout(60)
-                .call()
-                .use { git ->
-                    check(git.repository.branch == "main") {
-                        "Se esperaba la rama main después del clone."
+            repositoryDirectory.parentFile?.mkdirs()
+            val stagingDirectory = File(repositoryDirectory.parentFile, ".${repositoryDirectory.name}.preparing-${java.util.UUID.randomUUID()}")
+            temporaryDirectory = stagingDirectory
+            val credentials = if (token.isNotEmpty()) UsernamePasswordCredentialsProvider("x-access-token", token) else null
+            try {
+                Git.cloneRepository()
+                    .setURI(repositoryUrl)
+                    .setDirectory(stagingDirectory)
+                    .setBranch("refs/heads/$branch")
+                    .setCredentialsProvider(credentials)
+                    .setTimeout(60)
+                    .call()
+                    .use { git ->
+                        check(git.repository.branch == branch && git.repository.exactRef(remoteTrackingRef) != null) {
+                            "La rama configurada no existe después del clone."
+                        }
                     }
-                }
+            } finally {
+                credentials?.clear()
+            }
+            Files.move(stagingDirectory.toPath(), repositoryDirectory.toPath())
+            temporaryDirectory = null
             return RepositoryPreparationResult(
                 success = true,
                 repositoryPath = repositoryDirectory.absolutePath,
@@ -196,19 +216,48 @@ class RepositoryStateService(
             )
         } catch (failure: Throwable) {
             if (failure !is Exception && failure !is LinkageError) throw failure
+            val missingBranch = generateSequence(failure) { it.cause }.take(5).any {
+                it.javaClass.simpleName.contains("RefNotFound") ||
+                    it.message.orEmpty().contains("rama configurada no existe", ignoreCase = true) ||
+                    it.message.orEmpty().contains("branch not found", ignoreCase = true) ||
+                    (it.message.orEmpty().contains("refs/heads/$branch") &&
+                        (it.message.orEmpty().contains("does not have", ignoreCase = true) ||
+                            it.message.orEmpty().contains("not found", ignoreCase = true) ||
+                            it.message.orEmpty().contains("no such", ignoreCase = true)))
+            }
+            val authFailure = !missingBranch && (isAuthenticationFailure(failure) ||
+                token.isEmpty() && generateSequence(failure) { it.cause }.take(5).any {
+                    val detail = it.message.orEmpty().lowercase()
+                    "repository not found" in detail || "404" in detail
+                })
             return RepositoryPreparationResult(
                 success = false,
                 repositoryPath = repositoryDirectory.absolutePath,
                 cloned = false,
-                message = "No se pudo preparar el repositorio.",
-                error = causeChain(failure),
+                message = when {
+                    authFailure && token.isEmpty() -> "Este repositorio necesita autorización de GitHub."
+                    authFailure -> "GitHub rechazó las credenciales."
+                    missingBranch -> "La rama configurada $branch no existe en este repositorio."
+                    else -> "No se pudo preparar el repositorio."
+                },
+                error = safeFailure("Preparación del repositorio", failure),
+                authenticationRequired = authFailure,
             )
+        } finally {
+            temporaryDirectory?.let { temp ->
+                if (temp.canonicalFile.parentFile == repositoryDirectory.parentFile?.canonicalFile &&
+                    temp.name.startsWith(".${repositoryDirectory.name}.preparing-")) {
+                    temp.deleteRecursively()
+                }
+            }
+            Arrays.fill(token, '\u0000')
         }
     }
 
     /** Fetches origin and then calculates state without changing HEAD or working-tree files. */
-    fun refreshState(repositoryDirectory: File): RepositoryStateSnapshot {
+    fun refreshState(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryStateSnapshot {
         val checkedAt = Instant.now()
+        val credentials = if (token.isNotEmpty()) UsernamePasswordCredentialsProvider("x-access-token", token) else null
         try {
             check(File(repositoryDirectory, ".git").isDirectory) {
                 "El repositorio persistente todavía no está preparado."
@@ -217,13 +266,14 @@ class RepositoryStateService(
                 validateFunctionalRepository(git)
 
                 try {
-                    fetchOrigin(git)
+                    fetchOrigin(git, credentials)
                 } catch (failure: Throwable) {
                     if (failure !is Exception && failure !is LinkageError) throw failure
                     return errorSnapshot(
                         checkedAt,
                         "No se pudo actualizar el estado desde GitHub. El estado remoto no está verificado.",
                         failure,
+                        authenticationRequired = isAuthenticationFailure(failure),
                     )
                 }
                 return inspectFetchedState(git, checkedAt)
@@ -235,12 +285,16 @@ class RepositoryStateService(
                 "No se ha podido determinar el estado del repositorio con seguridad.",
                 failure,
             )
+        } finally {
+            credentials?.clear()
+            Arrays.fill(token, '\u0000')
         }
     }
 
     /** Revalidates with fetch and applies only a verified fast-forward of main. */
-    fun downloadFastForward(repositoryDirectory: File): DownloadResult {
+    fun downloadFastForward(repositoryDirectory: File, token: CharArray = charArrayOf()): DownloadResult {
         val checkedAt = Instant.now()
+        val credentials = if (token.isNotEmpty()) UsernamePasswordCredentialsProvider("x-access-token", token) else null
         try {
             check(File(repositoryDirectory, ".git").isDirectory) {
                 "El repositorio persistente todavía no está preparado."
@@ -248,13 +302,14 @@ class RepositoryStateService(
             Git.open(repositoryDirectory).use { git ->
                 validateFunctionalRepository(git)
                 try {
-                    fetchOrigin(git)
+                    fetchOrigin(git, credentials)
                 } catch (failure: Throwable) {
                     if (failure !is Exception && failure !is LinkageError) throw failure
                     val failureState = errorSnapshot(
                         checkedAt,
                         "No se pudo actualizar el estado desde GitHub. El estado remoto no está verificado.",
                         failure,
+                        authenticationRequired = isAuthenticationFailure(failure),
                     )
                     return downloadError(
                         "No se ha podido comprobar GitHub con seguridad. No se realizó ningún cambio.",
@@ -270,13 +325,13 @@ class RepositoryStateService(
 
                 val repository = git.repository
                 val previousHead = repository.resolve(Constants.HEAD)
-                val fetchedRemoteHead = repository.resolve("refs/remotes/origin/main")
+                val fetchedRemoteHead = repository.resolve(remoteTrackingRef)
                 check(previousHead != null && fetchedRemoteHead != null)
 
                 // Guard again immediately before MergeCommand in case local files or refs changed.
                 val immediateChanges = readWorkingTreeChanges(git)
                 val immediateLocalHead = repository.resolve(Constants.HEAD)
-                val immediateRemoteHead = repository.resolve("refs/remotes/origin/main")
+                val immediateRemoteHead = repository.resolve(remoteTrackingRef)
                 if (immediateChanges.hasChanges ||
                     immediateLocalHead != previousHead ||
                     immediateRemoteHead != fetchedRemoteHead
@@ -314,12 +369,12 @@ class RepositoryStateService(
 
                 val finalState = inspectFetchedState(git, Instant.now())
                 val newHead = repository.resolve(Constants.HEAD)
-                val finalRemoteHead = repository.resolve("refs/remotes/origin/main")
+                val finalRemoteHead = repository.resolve(remoteTrackingRef)
                 check(newHead == fetchedRemoteHead) {
                     "HEAD no coincide con el commit remoto obtenido mediante fetch."
                 }
                 check(finalRemoteHead == fetchedRemoteHead) {
-                    "origin/main cambió durante la operación."
+                    "$remoteTrackingRef cambió durante la operación."
                 }
                 check(finalState.type == RepositoryStateType.SYNCHRONIZED)
                 check(finalState.ahead == 0 && finalState.behind == 0)
@@ -347,6 +402,9 @@ class RepositoryStateService(
                     failure,
                 ),
             )
+        } finally {
+            credentials?.clear()
+            Arrays.fill(token, '\u0000')
         }
     }
 
@@ -449,7 +507,7 @@ class RepositoryStateService(
                 }
 
                 previousHead = git.repository.resolve(Constants.HEAD)
-                val baselineRemote = git.repository.resolve("refs/remotes/origin/main")
+                val baselineRemote = git.repository.resolve(remoteTrackingRef)
                 check(previousHead != null && baselineRemote != null)
 
                 if (initialState.changes.hasChanges) {
@@ -516,7 +574,7 @@ class RepositoryStateService(
                     )
                 }
 
-                val remoteBeforePush = git.repository.resolve("refs/remotes/origin/main")
+                val remoteBeforePush = git.repository.resolve(remoteTrackingRef)
                 check(remoteBeforePush != null)
                 if (remoteBeforePush != baselineRemote) {
                     val latest = inspectFetchedState(git, Instant.now())
@@ -546,7 +604,7 @@ class RepositoryStateService(
                 val commitsToUpload = relationBeforePush.ahead
 
                 val pushResult = try {
-                    remoteGateway.pushMain(git, requireNotNull(credentials))
+                    remoteGateway.pushBranch(git, requireNotNull(credentials), branch)
                 } catch (failure: Throwable) {
                     if (failure !is Exception && failure !is LinkageError) throw failure
                     if (isAuthenticationFailure(failure)) {
@@ -672,10 +730,12 @@ class RepositoryStateService(
             }
 
             // refreshState performs the mandatory initial fetch and graph recalculation.
-            val state = refreshState(repositoryDirectory)
+            val state = refreshState(repositoryDirectory, token.copyOf())
             if (state.type == RepositoryStateType.ERROR) {
                 return SynchronizationResult(
-                    outcome = if (state.remoteStateIsFresh) {
+                    outcome = if (state.authenticationRequired) {
+                        SynchronizationOutcome.AUTH_REQUIRED
+                    } else if (state.remoteStateIsFresh) {
                         SynchronizationOutcome.ERROR
                     } else {
                         SynchronizationOutcome.FETCH_ERROR
@@ -709,7 +769,7 @@ class RepositoryStateService(
                             finalState = state,
                         )
                     } else {
-                        mapDownloadForSynchronization(downloadFastForward(repositoryDirectory))
+                        mapDownloadForSynchronization(downloadFastForward(repositoryDirectory, token.copyOf()))
                     }
                 }
                 CommitRelation.LOCAL_AHEAD -> mapUploadForSynchronization(
@@ -739,7 +799,11 @@ class RepositoryStateService(
             outcome = when (download.outcome) {
                 DownloadOutcome.SUCCESS -> SynchronizationOutcome.SUCCESS_DOWNLOADED
                 DownloadOutcome.ALREADY_SYNCHRONIZED -> SynchronizationOutcome.NOTHING_TO_DO
-                DownloadOutcome.FETCH_ERROR -> SynchronizationOutcome.FETCH_ERROR
+                DownloadOutcome.FETCH_ERROR -> if (download.finalState?.authenticationRequired == true) {
+                    SynchronizationOutcome.AUTH_REQUIRED
+                } else {
+                    SynchronizationOutcome.FETCH_ERROR
+                }
                 DownloadOutcome.DIVERGED -> SynchronizationOutcome.BLOCKED_DIVERGED
                 DownloadOutcome.BLOCKED_LOCAL_CHANGES -> {
                     SynchronizationOutcome.BLOCKED_CHANGES_ON_BOTH_SIDES
@@ -825,7 +889,7 @@ class RepositoryStateService(
         return try {
             // This is the only remote query after an ambiguous push. Never retry the push.
             remoteGateway.fetch(git, credentials)
-            val remoteHead = git.repository.resolve("refs/remotes/origin/main")
+            val remoteHead = git.repository.resolve(remoteTrackingRef)
             if (remoteHead == attemptedHead) {
                 val finalState = inspectFetchedState(git, Instant.now())
                 uploadResult(
@@ -883,7 +947,7 @@ class RepositoryStateService(
         return try {
             remoteGateway.fetch(git, credentials)
             val finalState = inspectFetchedState(git, Instant.now())
-            val finalRemote = git.repository.resolve("refs/remotes/origin/main")
+            val finalRemote = git.repository.resolve(remoteTrackingRef)
             check(finalRemote != null)
             val attemptedIsPresent = finalRemote == attemptedHead ||
                 isMergedInto(git.repository, attemptedHead, finalRemote)
@@ -964,7 +1028,8 @@ class RepositoryStateService(
         generateSequence(failure) { it.cause }.take(5).any {
             val text = "${it.javaClass.name} ${it.message.orEmpty()}".lowercase()
             "not authorized" in text || "authentication" in text ||
-                "unauthorized" in text || "401" in text || "403" in text
+                "unauthorized" in text || "401" in text || "403" in text ||
+                "repository not found" in text || "404" in text
         }
 
     /** Returns diagnostic classes only; exception messages can contain credential material. */
@@ -978,8 +1043,8 @@ class RepositoryStateService(
         check(!repository.isBare && repository.objectDatabase.exists()) {
             "El repositorio persistente no es válido."
         }
-        check(repository.branch == "main") {
-            "Se esperaba la rama main, se obtuvo ${repository.branch}."
+        check(repository.branch == branch) {
+            "Se esperaba la rama $branch, se obtuvo ${repository.branch}."
         }
         val origin = repository.config.getString("remote", "origin", "url")
         check(origin != null && URIish(origin) == URIish(repositoryUrl)) {
@@ -995,17 +1060,17 @@ class RepositoryStateService(
         }
     }
 
-    private fun fetchOrigin(git: Git) {
-        remoteGateway.fetch(git, null)
+    private fun fetchOrigin(git: Git, credentials: CredentialsProvider?) {
+        remoteGateway.fetch(git, credentials)
     }
 
     private fun inspectFetchedState(git: Git, checkedAt: Instant): RepositoryStateSnapshot {
         val repository = git.repository
         val branch = repository.branch
         val localHead = repository.resolve(Constants.HEAD)
-        val remoteHead = repository.resolve("refs/remotes/origin/main")
+        val remoteHead = repository.resolve(remoteTrackingRef)
         check(localHead != null) { "HEAD local no existe." }
-        check(remoteHead != null) { "origin/main no existe después del fetch." }
+        check(remoteHead != null) { "$remoteTrackingRef no existe después del fetch." }
 
         val relation = calculateRelation(repository, localHead, remoteHead)
         val changes = readWorkingTreeChanges(git)
@@ -1144,6 +1209,7 @@ class RepositoryStateService(
         checkedAt: Instant,
         message: String,
         failure: Throwable,
+        authenticationRequired: Boolean = false,
     ) = RepositoryStateSnapshot(
         type = RepositoryStateType.ERROR,
         relation = CommitRelation.UNDETERMINED,
@@ -1157,6 +1223,7 @@ class RepositoryStateService(
         checkedAt = checkedAt,
         remoteStateIsFresh = false,
         error = causeChain(failure),
+        authenticationRequired = authenticationRequired,
     )
 
     private data class CommitCounts(

@@ -5,6 +5,18 @@ import org.junit.Test
 import java.time.Instant
 
 class RepositoryHumanStatusTest {
+    @Test fun noRepositoriesShowsAnEmptyState() {
+        assertEquals("No tienes repositorios configurados.", RepositoryStatusPresenter.noRepositories.title)
+    }
+
+    @Test fun missingConfiguredBranchGetsHumanExplanation() {
+        val shown = RepositoryStatusPresenter.present(
+            state(RepositoryStateType.ERROR, CommitRelation.UNDETERMINED, fresh = false)
+                .copy(error = "refs/remotes/origin/develop no existe después del fetch"),
+        )
+        assertEquals("La rama configurada no está disponible.", shown.title)
+    }
+
     private fun state(
         type: RepositoryStateType,
         relation: CommitRelation,

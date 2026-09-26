@@ -1,18 +1,24 @@
 # RobGit — Git seguro con una interfaz humana
 
-La pantalla principal de RobGit presenta el estado del repositorio en castellano claro, sin exponer HEAD, refs, ahead/behind ni otros conceptos técnicos. Utiliza una identidad propia azul petróleo y blanco hielo, ofrece PULL, PUSH y SINCRONIZAR mediante el motor seguro existente y analiza automáticamente al abrir la app, al volver realmente desde segundo plano y después de cada operación. La rotación conserva el estado y no provoca una consulta remota nueva.
+La pantalla principal de RobGit presenta el estado del repositorio en castellano claro, sin exponer HEAD, refs, ahead/behind ni otros conceptos técnicos. Utiliza una identidad propia azul petróleo y blanco hielo, ofrece PULL, PUSH y SINCRONIZAR mediante el motor seguro existente y analiza automáticamente al abrir la app, al volver realmente desde segundo plano, al cambiar de repositorio y después de cada operación. La rotación conserva el estado y no provoca una consulta remota nueva.
 
-El menú superior reúne el análisis manual, los detalles técnicos y los ajustes de diagnóstico. El PAT y el mensaje de cambio solo aparecen cuando una subida los necesita; el token vive exclusivamente en memoria. La interfaz del Asistente RobGit ya permite escoger una orden y escribir una pregunta, pero **la IA todavía no está conectada** y no realiza ninguna llamada de red.
+## Mis repositorios
+
+El selector permite añadir y elegir repositorios GitHub con nombre, URL HTTPS y rama configurables. Un registro persistente en el almacenamiento privado de la app guarda la lista y la selección, sin credenciales. La primera apertura migra automáticamente `Robgit.pruebas` y reutiliza `filesDir/repos/robgit-pruebas` si ya existe. Cada repositorio nuevo recibe un directorio interno propio con identificador seguro bajo `filesDir/repos/`.
+
+En Ajustes se pueden consultar las configuraciones y quitarlas de la lista; esta acción conserva todos los archivos locales. Los repositorios siguen en el almacenamiento privado de la app. Un workspace externo mediante SAF queda pendiente para una fase posterior.
+
+El menú superior reúne el análisis manual, los detalles técnicos y los ajustes de diagnóstico. El PAT se solicita al subir o cuando un repositorio privado lo requiere para preparar, analizar, descargar o sincronizar; el mensaje de cambio solo aparece para una subida. El token vive exclusivamente en memoria. La interfaz del Asistente RobGit ya permite escoger una orden y escribir una pregunta, pero **la IA todavía no está conectada** y no realiza ninguna llamada de red.
 
 ## Diseño adaptable
 
 En móviles la aplicación funciona solo en vertical. Las tablets admiten vertical y horizontal; en apaisado, el selector y el estado ocupan la zona izquierda y la cuadrícula de acciones la derecha, con un ancho máximo para evitar controles sobredimensionados.
 
-Este proyecto valida en Android operaciones Git seguras mediante Eclipse JGit 7.8. Conserva los spikes de diagnóstico local, clone HTTPS y push autenticado, y utiliza una copia persistente de `robdor80/Robgit.pruebas` para las funciones de estado, descarga y subida.
+Este proyecto valida en Android operaciones Git seguras mediante Eclipse JGit 7.8. Conserva los spikes de diagnóstico local, clone HTTPS y push autenticado. El motor funcional actúa sobre el repositorio seleccionado.
 
 ## Compilar y probar
 
-Se necesitan Android SDK 36, JDK 17 y Android API 34 o superior en el dispositivo. Desde la raíz del repositorio:
+Se necesitan Android SDK 36, JDK 17 y Android API 33 o superior en el dispositivo. Desde la raíz del repositorio:
 
 ```powershell
 .\gradlew.bat :app:testDebugUnitTest :app:assembleDebug
@@ -30,21 +36,21 @@ Los tests JVM comprueban el contenido local dentro del commit, que la prueba no 
 
 ## Estado del repositorio funcional
 
-La sección **RobGit — Estado del repositorio** prepara una única copia persistente de `robdor80/Robgit.pruebas` en `filesDir/repos/robgit-pruebas`. Si la carpeta ya existe, la abre y nunca clona encima ni elimina su contenido.
+Cada repositorio configurado se prepara en su propio directorio privado. El repositorio original `Robgit.pruebas` conserva `filesDir/repos/robgit-pruebas`. Si una carpeta ya existe, RobGit verifica remoto y rama y no clona encima ni elimina su contenido.
 
-**ACTUALIZAR ESTADO** realiza primero un `fetch` y después calcula la relación real del grafo entre `HEAD` y `origin/main`: sincronizado, local adelantado, remoto adelantado o divergente, con el número de commits exclusivos de cada lado. El working tree se representa por separado mediante archivos nuevos, modificados, eliminados, staged y en conflicto. Si el fetch falla, el resultado es `ERROR` y nunca se presenta como sincronizado.
+**ANALIZAR AHORA** realiza primero un `fetch` y después calcula la relación real del grafo entre `HEAD` y la rama remota configurada: sincronizado, local adelantado, remoto adelantado o divergente, con el número de commits exclusivos de cada lado. El working tree se representa por separado mediante archivos nuevos, modificados, eliminados, staged y en conflicto. Si el fetch falla, el resultado es `ERROR` y nunca se presenta como sincronizado.
 
-Cuando el estado conocido indica que GitHub está adelantado, la rama es `main`, el working tree está limpio y no hay commits locales pendientes, se habilita **↓ DESCARGAR**. La operación no confía en ese estado mostrado: vuelve a ejecutar `fetch`, recalcula el grafo y revalida todas las condiciones antes de aplicar exclusivamente un fast-forward con `FastForwardMode.FF_ONLY`.
+Cuando el estado conocido indica que GitHub está adelantado, el working tree está limpio y no hay commits locales pendientes, se habilita **↓ PULL**. La operación no confía en ese estado mostrado: vuelve a ejecutar `fetch`, recalcula el grafo y revalida todas las condiciones antes de aplicar exclusivamente un fast-forward con `FastForwardMode.FF_ONLY`.
 
-DESCARGAR no usa `pull`, `reset`, `force`, stash, checkout destructivo ni crea commits de merge. Se bloquea ante cambios locales, commits locales o divergencia; distingue también repositorio ya sincronizado, error de fetch y error general. Tras un fast-forward verifica que `HEAD` coincide exactamente con `origin/main`, que ahead/behind son cero y que el working tree está limpio.
+PULL no usa `pull` de JGit, `reset`, `force`, stash, checkout destructivo ni crea commits de merge. Se bloquea ante cambios locales, commits locales o divergencia; distingue también repositorio ya sincronizado, error de fetch y error general. Tras un fast-forward verifica que `HEAD` coincide exactamente con `origin/<rama configurada>`, que ahead/behind son cero y que el working tree está limpio.
 
 La suite JVM incluye escenarios deterministas con remotos Git locales para un commit remoto, varios commits, operación idempotente, archivos modificados, untracked y staged, commits locales, divergencia, fallo de fetch y estado de UI obsoleto. También verifica contenido, refs, limpieza del working tree y ausencia de commits extra.
 
 ## Subida segura
 
-**↑ SUBIR** vuelve a ejecutar `fetch` y recalcula el estado real antes de modificar el índice. Solo continúa si `main` puede avanzar de forma normal sobre `origin/main`. Incluye archivos nuevos, modificados y eliminados no ignorados; crea exactamente un commit cuando hay cambios pendientes o reutiliza los commits locales existentes cuando el working tree ya está limpio.
+**↑ PUSH** vuelve a ejecutar `fetch` y recalcula el estado real antes de modificar el índice. Solo continúa si la rama configurada puede avanzar de forma normal sobre su rama remota. Incluye archivos nuevos, modificados y eliminados no ignorados; crea exactamente un commit cuando hay cambios pendientes o reutiliza los commits locales existentes cuando el working tree ya está limpio.
 
-Antes del push realiza un segundo `fetch` y bloquea la operación si GitHub cambió. El push se limita a `refs/heads/main:refs/heads/main`, con force desactivado. Un rechazo conserva todo el trabajo local. Si la respuesta del push es ambigua, realiza una única comprobación remota y nunca reintenta automáticamente.
+Antes del push realiza un segundo `fetch` y bloquea la operación si GitHub cambió. El push se limita a `refs/heads/<rama configurada>:refs/heads/<rama configurada>`, con force desactivado. Un rechazo conserva todo el trabajo local. Si la respuesta del push es ambigua, realiza una única comprobación remota y nunca reintenta automáticamente.
 
 El PAT se mantiene únicamente en memoria, se muestra enmascarado y se limpia al comenzar y finalizar la operación. No se guarda en preferencias, archivos, URLs, logs ni mensajes de error. Los tests de SUBIR utilizan exclusivamente repositorios bare locales y cubren staging, commits existentes, carreras remotas, rechazos non-fast-forward, credenciales, fallos de fetch y respuestas ambiguas. El Hito 6 todavía requiere validación física en la Galaxy Tab S9+.
 
@@ -52,4 +58,4 @@ El PAT se mantiene únicamente en memoria, se muestra enmascarado y se limpia al
 
 **↕ SINCRONIZAR** es el flujo principal conservador. Siempre hace `fetch` y recalcula el estado real antes de decidir: si ya está sincronizado no actúa; si GitHub está adelantado y el árbol está limpio delega en DESCARGAR; si solo hay trabajo local delega en SUBIR. Cada ejecución realiza como máximo una de esas operaciones, nunca ambas.
 
-Si hay cambios en este dispositivo y en GitHub, divergencia, conflictos o fallo de fetch, se bloquea sin intentar merge, rebase, reset ni resolución automática. El PAT solo se exige cuando la decisión requiere SUBIR. La validación física de SINCRONIZAR queda pendiente.
+Si hay cambios en este dispositivo y en GitHub, divergencia, conflictos o fallo de fetch, se bloquea sin intentar merge, rebase, reset ni resolución automática. El PAT también puede ser necesario para consultar o descargar de un repositorio privado. La validación física multi-repositorio de este hito queda pendiente.
