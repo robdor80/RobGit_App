@@ -44,4 +44,4 @@ El PAT se mantiene únicamente en memoria, se muestra enmascarado y se limpia al
 
 **↕ SINCRONIZAR** es el flujo principal conservador. Siempre hace `fetch` y recalcula el estado real antes de decidir: si ya está sincronizado no actúa; si GitHub está adelantado y el árbol está limpio delega en DESCARGAR; si solo hay trabajo local delega en SUBIR. Cada ejecución realiza como máximo una de esas operaciones, nunca ambas.
 
-Si hay cambios en este dispositivo y en GitHub, divergencia, conflictos o fallo de fetch, se bloquea sin intentar merge, rebase, reset ni resolución automática. El PAT solo se exige cuando la decisión requiere SUBIR. La validación física de SINCRONIZAR queda pendiente. También permanece pendiente el refresco visual del resultado tras rotar la Activity.
+Si hay cambios en este dispositivo y en GitHub, divergencia, conflictos o fallo de fetch, se bloquea sin intentar merge, rebase, reset ni resolución automática. El PAT solo se exige cuando la decisión requiere SUBIR. La validación física de SINCRONIZAR queda pendiente.

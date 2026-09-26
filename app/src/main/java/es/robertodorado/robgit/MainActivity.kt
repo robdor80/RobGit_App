@@ -23,6 +23,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
@@ -62,13 +64,18 @@ private fun DiagnosticScreen(
     repositoryStateService: RepositoryStateService,
     functionalRepository: File,
 ) {
-    var repositoryPrepared by remember { mutableStateOf<Boolean?>(null) }
+    var repositoryPrepared by rememberSaveable { mutableStateOf<Boolean?>(null) }
     var preparationResult by remember { mutableStateOf<RepositoryPreparationResult?>(null) }
-    var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
+    var repositoryState by rememberSaveable(stateSaver = repositoryStateSaver) {
+        mutableStateOf<RepositoryStateSnapshot?>(null)
+    }
     var downloadResult by remember { mutableStateOf<DownloadResult?>(null) }
     var uploadResult by remember { mutableStateOf<UploadResult?>(null) }
     var synchronizationResult by remember { mutableStateOf<SynchronizationResult?>(null) }
-    var commitMessage by remember { mutableStateOf("Cambios desde RobGit") }
+    var lastOperation by rememberSaveable(stateSaver = lastOperationSaver) {
+        mutableStateOf<RestoredOperation?>(null)
+    }
+    var commitMessage by rememberSaveable { mutableStateOf("Cambios desde RobGit") }
     var localResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteResult by remember { mutableStateOf<DiagnosticResult?>(null) }
     var pushResult by remember { mutableStateOf<DiagnosticResult?>(null) }
@@ -106,6 +113,7 @@ private fun DiagnosticScreen(
                         downloadResult = null
                         uploadResult = null
                         synchronizationResult = null
+                        lastOperation = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -113,6 +121,12 @@ private fun DiagnosticScreen(
                                 }
                                 preparationResult = completed
                                 repositoryPrepared = completed.success
+                                lastOperation = RestoredOperation(
+                                    operation = "PREPARAR REPOSITORIO",
+                                    outcome = if (completed.success) "OK" else "ERROR",
+                                    message = completed.message,
+                                    detail = completed.error,
+                                )
                                 if (completed.success) {
                                     Log.i("RobGitState", completed.message)
                                 } else {
@@ -137,12 +151,19 @@ private fun DiagnosticScreen(
                         downloadResult = null
                         uploadResult = null
                         synchronizationResult = null
+                        lastOperation = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
                                     repositoryStateService.refreshState(functionalRepository)
                                 }
                                 repositoryState = completed
+                                lastOperation = RestoredOperation(
+                                    operation = "ACTUALIZAR ESTADO",
+                                    outcome = completed.type.name,
+                                    message = completed.message,
+                                    detail = completed.error,
+                                )
                                 if (completed.error == null) {
                                     Log.i("RobGitState", "${completed.type}: ${completed.message}")
                                 } else {
@@ -203,6 +224,7 @@ private fun DiagnosticScreen(
                         synchronizationResult = null
                         downloadResult = null
                         uploadResult = null
+                        lastOperation = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -213,6 +235,12 @@ private fun DiagnosticScreen(
                                     )
                                 }
                                 synchronizationResult = completed
+                                lastOperation = RestoredOperation(
+                                    operation = "↕ SINCRONIZAR",
+                                    outcome = completed.outcome.name,
+                                    message = completed.message,
+                                    detail = completed.error,
+                                )
                                 completed.finalState?.let { repositoryState = it }
                                 if (completed.outcome == SynchronizationOutcome.SUCCESS_DOWNLOADED ||
                                     completed.outcome == SynchronizationOutcome.SUCCESS_UPLOADED ||
@@ -252,12 +280,19 @@ private fun DiagnosticScreen(
                         downloadResult = null
                         uploadResult = null
                         synchronizationResult = null
+                        lastOperation = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
                                     repositoryStateService.downloadFastForward(functionalRepository)
                                 }
                                 downloadResult = completed
+                                lastOperation = RestoredOperation(
+                                    operation = "↓ DESCARGAR",
+                                    outcome = completed.outcome.name,
+                                    message = completed.message,
+                                    detail = completed.error,
+                                )
                                 completed.finalState?.let { repositoryState = it }
                                 if (completed.outcome == DownloadOutcome.SUCCESS ||
                                     completed.outcome == DownloadOutcome.ALREADY_SYNCHRONIZED
@@ -294,6 +329,7 @@ private fun DiagnosticScreen(
                         uploadResult = null
                         downloadResult = null
                         synchronizationResult = null
+                        lastOperation = null
                         scope.launch {
                             try {
                                 val completed = withContext(Dispatchers.IO) {
@@ -304,6 +340,12 @@ private fun DiagnosticScreen(
                                     )
                                 }
                                 uploadResult = completed
+                                lastOperation = RestoredOperation(
+                                    operation = "↑ SUBIR",
+                                    outcome = completed.outcome.name,
+                                    message = completed.message,
+                                    detail = completed.error,
+                                )
                                 completed.finalState?.let { repositoryState = it }
                                 if (completed.outcome == UploadOutcome.SUCCESS ||
                                     completed.outcome == UploadOutcome.NOTHING_TO_UPLOAD
@@ -333,6 +375,9 @@ private fun DiagnosticScreen(
             DownloadResultPanel(downloadResult)
             UploadResultPanel(uploadResult)
             SynchronizationResultPanel(synchronizationResult)
+            if (downloadResult == null && uploadResult == null && synchronizationResult == null) {
+                RestoredOperationPanel(lastOperation)
+            }
 
             Text("Herramientas de diagnóstico", style = MaterialTheme.typography.headlineSmall)
             Text("Prueba local", style = MaterialTheme.typography.titleLarge)
@@ -546,6 +591,15 @@ private fun SynchronizationResultPanel(result: SynchronizationResult?) {
 }
 
 @Composable
+private fun RestoredOperationPanel(operation: RestoredOperation?) {
+    operation ?: return
+    Text("Última operación: ${operation.operation}")
+    Text("Resultado: ${operation.outcome}")
+    Text(operation.message)
+    operation.detail?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+}
+
+@Composable
 private fun DiagnosticResultPanel(result: DiagnosticResult?, running: Boolean) {
     Text("JGit: ${if (running) "ejecutando" else if (result == null) "pendiente" else if (result.error == null) "correcto" else "error"}")
     Text("Directorio del repositorio: ${result?.repositoryPath ?: "pendiente"}")
@@ -566,3 +620,85 @@ private fun logResult(operation: String, result: DiagnosticResult) {
 private fun describeFailure(error: Throwable): String = generateSequence(error) { it.cause }
     .take(5)
     .joinToString(" ← ") { "${it.javaClass.name}: ${it.message ?: "sin detalle"}" }
+
+internal data class RestoredOperation(
+    val operation: String,
+    val outcome: String,
+    val message: String,
+    val detail: String?,
+)
+
+internal val lastOperationSaver = Saver<RestoredOperation?, Any>(
+    save = { operation ->
+        operation?.let { listOf(it.operation, it.outcome, it.message, it.detail) }
+    },
+    restore = { saved ->
+        val values = saved as? List<*> ?: return@Saver null
+        RestoredOperation(
+            operation = values.getOrNull(0) as? String ?: return@Saver null,
+            outcome = values.getOrNull(1) as? String ?: return@Saver null,
+            message = values.getOrNull(2) as? String ?: return@Saver null,
+            detail = values.getOrNull(3) as? String,
+        )
+    },
+)
+
+internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(
+    save = { state ->
+        state?.let {
+            listOf(
+                it.type.name,
+                it.relation.name,
+                it.message,
+                it.branch,
+                it.localHead,
+                it.remoteHead,
+                it.ahead,
+                it.behind,
+                it.changes.newFiles.toList(),
+                it.changes.modifiedFiles.toList(),
+                it.changes.deletedFiles.toList(),
+                it.changes.stagedFiles.toList(),
+                it.changes.conflictingFiles.toList(),
+                it.checkedAt.toString(),
+                it.remoteStateIsFresh,
+                it.error,
+            )
+        }
+    },
+    restore = { saved ->
+        val values = saved as? List<*> ?: return@Saver null
+        fun stringAt(index: Int): String? = values.getOrNull(index) as? String
+        fun filesAt(index: Int): Set<String> =
+            (values.getOrNull(index) as? List<*>)
+                ?.mapNotNull { it as? String }
+                ?.toSet()
+                ?: emptySet()
+        val type = stringAt(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() }
+            ?: return@Saver null
+        val relation = stringAt(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() }
+            ?: return@Saver null
+        val checkedAt = stringAt(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() }
+            ?: return@Saver null
+        RepositoryStateSnapshot(
+            type = type,
+            relation = relation,
+            message = stringAt(2) ?: return@Saver null,
+            branch = stringAt(3),
+            localHead = stringAt(4),
+            remoteHead = stringAt(5),
+            ahead = values.getOrNull(6) as? Int ?: return@Saver null,
+            behind = values.getOrNull(7) as? Int ?: return@Saver null,
+            changes = WorkingTreeChanges(
+                newFiles = filesAt(8),
+                modifiedFiles = filesAt(9),
+                deletedFiles = filesAt(10),
+                stagedFiles = filesAt(11),
+                conflictingFiles = filesAt(12),
+            ),
+            checkedAt = checkedAt,
+            remoteStateIsFresh = values.getOrNull(14) as? Boolean ?: return@Saver null,
+            error = stringAt(15),
+        )
+    },
+)
