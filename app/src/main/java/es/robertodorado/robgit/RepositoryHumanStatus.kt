@@ -23,6 +23,11 @@ object RepositoryStatusPresenter {
         explanation = "RobGit está comprobando este dispositivo y GitHub.",
     )
 
+    val notUpdated = RepositoryHumanStatus(
+        title = "Estado sin actualizar",
+        explanation = "Pulsa el logo de RobGit para analizar el repositorio.",
+    )
+
     val notPrepared = RepositoryHumanStatus(
         title = "Este repositorio todavía no está preparado en este dispositivo.",
         explanation = "Prepáralo una vez para que RobGit pueda trabajar con él de forma segura.",

@@ -25,7 +25,6 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
-import androidx.compose.runtime.saveable.Saver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -123,11 +122,11 @@ private fun RobGitScreen(
         selectedRepository?.let { RepositoryStateService(repositoryUrl = it.remoteUrl, branch = it.branch) }
     }
     var repositoryPrepared by rememberSaveable { mutableStateOf<Boolean?>(null) }
-    var repositoryState by rememberSaveable(stateSaver = repositoryStateSaver) { mutableStateOf<RepositoryStateSnapshot?>(null) }
-    var lastOperation by rememberSaveable(stateSaver = lastOperationSaver) { mutableStateOf<RestoredOperation?>(null) }
-    var noticeTitle by rememberSaveable { mutableStateOf<String?>(null) }
-    var noticeBody by rememberSaveable { mutableStateOf<String?>(null) }
-    var noticeRecommendation by rememberSaveable { mutableStateOf<String?>(null) }
+    var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
+    var lastOperation by remember { mutableStateOf<RestoredOperation?>(null) }
+    var noticeTitle by remember { mutableStateOf<String?>(null) }
+    var noticeBody by remember { mutableStateOf<String?>(null) }
+    var noticeRecommendation by remember { mutableStateOf<String?>(null) }
     var runningOperation by remember { mutableStateOf<String?>(null) }
     var showTechnical by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
@@ -334,8 +333,8 @@ private fun RobGitScreen(
                 catalog = completed.second
                 pendingMigrations = completed.third
                 repositoryPrepared = completed.first?.let { true }
-                repositoryState = completed.first
-                lastOperation = RestoredOperation("MIGRACIÓN", "OK", "Workspace compartido activado y analizado.", null)
+                repositoryState = null
+                lastOperation = RestoredOperation("MIGRACIÓN", "OK", "Workspace compartido activado y verificado.", null)
                 migrationPhase = MigrationPhase.COMPLETED
             } catch (failure: Exception) {
                 if (failure is kotlinx.coroutines.CancellationException) throw failure
@@ -387,10 +386,16 @@ private fun RobGitScreen(
     fun analyze() {
         val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
-        if (runningOperation != null || repositoryPrepared != true) return
+        if (runningOperation != null) return
         runningOperation = "analizando"; clearNotice()
         scope.launch {
             try {
+                val prepared = repositoryPrepared == true || withContext(Dispatchers.IO) { service.isPrepared(directory) }
+                if (!prepared) {
+                    repositoryPrepared = false
+                    return@launch
+                }
+                repositoryPrepared = true
                 val result = withContext(Dispatchers.IO) { gitOperations.analyze(service, directory) }
                 repositoryState = result
                 lastOperation = RestoredOperation("ANALIZAR AHORA", result.type.name, result.message, result.error)
@@ -411,8 +416,7 @@ private fun RobGitScreen(
                 repositoryPrepared = result.success
                 lastOperation = RestoredOperation("PREPARAR REPOSITORIO", if (result.success) "OK" else "ERROR", result.message, result.error)
                 if (result.success) {
-                    repositoryState = withContext(Dispatchers.IO) { gitOperations.analyze(service, directory) }
-                    if (repositoryState?.authenticationRequired == true) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
+                    repositoryState = null
                 }
                 else {
                     setNotice(if (result.authenticationRequired) gitAuthMessage() else result.message,
@@ -499,23 +503,17 @@ private fun RobGitScreen(
         }?.let { runCatching { workspaceResolver.resolve(it) }.getOrNull() }
         val service = repositoryService
         if (directory != null && service != null && repositoryPrepared == null) {
-            runningOperation = "analizando"
             try {
                 val prepared = withContext(Dispatchers.IO) { service.isPrepared(directory) }
                 repositoryPrepared = prepared
-                if (prepared) {
-                    repositoryState = withContext(Dispatchers.IO) { gitOperations.analyze(service, directory) }
-                    if (repositoryState?.authenticationRequired == true) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
-                }
-            } catch (failure: GitAccessUnavailableException) {
-                setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
-            } finally { runningOperation = null }
+            } catch (_: Exception) {
+                repositoryPrepared = false
+            }
         }
     }
     LaunchedEffect(foregroundReturn) {
         if (foregroundReturn > 0) {
             hasAllFilesAccess = Environment.isExternalStorageManager()
-            if (repositoryPrepared == true) analyze()
         }
     }
 
@@ -531,13 +529,12 @@ private fun RobGitScreen(
         catalog != null && selectedRepository == null -> RepositoryStatusPresenter.noRepositories
         repositoryPrepared == false -> RepositoryStatusPresenter.notPrepared
         repositoryState != null -> RepositoryStatusPresenter.present(requireNotNull(repositoryState))
-        else -> RepositoryStatusPresenter.analyzing
+        else -> RepositoryStatusPresenter.notUpdated
     }
     val displayedStatus = when {
         runningOperation == "migrando" -> RepositoryHumanStatus("Migrando repositorio…",
             migrationPhase?.humanLabel() ?: "Preparando…", blocked = true)
         migrationJournalError != null || selectedPendingMigration != null || sharedAccessMissing || workspaceResolutionError != null -> baseStatus
-        runningOperation == "analizando" -> RepositoryStatusPresenter.analyzing
         noticeTitle != null -> RepositoryHumanStatus(requireNotNull(noticeTitle), noticeBody.orEmpty(), noticeRecommendation)
         else -> baseStatus
     }
@@ -749,12 +746,17 @@ private fun RobGitScreen(
 private fun RobGitHeader(onAnalyze: () -> Unit, onTechnical: () -> Unit, onSettings: () -> Unit) {
     var open by remember { mutableStateOf(false) }
     Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-        Image(painterResource(R.drawable.ic_robgit_logo), "Icono de RobGit", contentScale = ContentScale.Fit, modifier = Modifier.size(42.dp))
+        Image(
+            painterResource(R.drawable.ic_robgit_logo), null,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier.size(42.dp)
+                .semantics { contentDescription = "Analizar ahora" }
+                .clickable(role = Role.Button, onClick = onAnalyze),
+        )
         Spacer(Modifier.width(12.dp)); Text("RobGit", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold); Spacer(Modifier.weight(1f))
         Box {
             Text("⋮", fontSize = 30.sp, textAlign = TextAlign.Center, modifier = Modifier.size(48.dp).semantics { contentDescription = "Abrir menú" }.clickable { open = true })
             DropdownMenu(open, { open = false }) {
-                DropdownMenuItem({ Text("ANALIZAR AHORA") }, { open = false; onAnalyze() })
                 DropdownMenuItem({ Text("DETALLES TÉCNICOS") }, { open = false; onTechnical() })
                 DropdownMenuItem({ Text("AJUSTES") }, { open = false; onSettings() })
             }
@@ -1109,13 +1111,3 @@ private fun SharedWorkspaceDiagnosticDialog(
 @Composable private fun DiagnosticSummary(result: DiagnosticResult?) { result?.let { Text(if (it.error == null) "Correcto · ${it.status}" else "Error · ${it.error}", style = MaterialTheme.typography.bodySmall) } }
 
 internal data class RestoredOperation(val operation: String, val outcome: String, val message: String, val detail: String?)
-internal val lastOperationSaver = Saver<RestoredOperation?, Any>(save = { it?.let { o -> listOf(o.operation, o.outcome, o.message, o.detail) } }, restore = { saved ->
-    val v = saved as? List<*> ?: return@Saver null
-    RestoredOperation(v.getOrNull(0) as? String ?: return@Saver null, v.getOrNull(1) as? String ?: return@Saver null, v.getOrNull(2) as? String ?: return@Saver null, v.getOrNull(3) as? String)
-})
-internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(save = { s -> s?.let { listOf(it.type.name, it.relation.name, it.message, it.branch, it.localHead, it.remoteHead, it.ahead, it.behind, it.changes.newFiles.toList(), it.changes.modifiedFiles.toList(), it.changes.deletedFiles.toList(), it.changes.stagedFiles.toList(), it.changes.conflictingFiles.toList(), it.checkedAt.toString(), it.remoteStateIsFresh, it.error, it.authenticationRequired, it.authenticationRejected, it.repositoryAccessDenied) } }, restore = { saved ->
-    val v = saved as? List<*> ?: return@Saver null
-    fun str(i: Int) = v.getOrNull(i) as? String
-    fun files(i: Int) = (v.getOrNull(i) as? List<*>)?.mapNotNull { it as? String }?.toSet() ?: emptySet()
-    RepositoryStateSnapshot(str(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() } ?: return@Saver null, str(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() } ?: return@Saver null, str(2) ?: return@Saver null, str(3), str(4), str(5), v.getOrNull(6) as? Int ?: return@Saver null, v.getOrNull(7) as? Int ?: return@Saver null, WorkingTreeChanges(files(8), files(9), files(10), files(11), files(12)), str(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() } ?: return@Saver null, v.getOrNull(14) as? Boolean ?: return@Saver null, str(15), v.getOrNull(16) as? Boolean ?: false, v.getOrNull(17) as? Boolean ?: false, v.getOrNull(18) as? Boolean ?: false)
-})

@@ -9,6 +9,13 @@ class RepositoryHumanStatusTest {
         assertEquals("No tienes repositorios configurados.", RepositoryStatusPresenter.noRepositories.title)
     }
 
+    @Test fun preparedRepositoryWithoutFreshStateRequestsManualAnalysis() {
+        val shown = RepositoryStatusPresenter.notUpdated
+        assertEquals("Estado sin actualizar", shown.title)
+        assertEquals("Pulsa el logo de RobGit para analizar el repositorio.", shown.explanation)
+        assertFalse(shown.blocked)
+    }
+
     @Test fun missingConfiguredBranchGetsHumanExplanation() {
         val shown = RepositoryStatusPresenter.present(
             state(RepositoryStateType.ERROR, CommitRelation.UNDETERMINED, fresh = false)
