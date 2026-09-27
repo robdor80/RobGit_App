@@ -14,7 +14,7 @@ La raíz de producción es `Documents/RobGit/`. Los repositorios nuevos se prepa
 
 La migración de un repositorio antiguo es manual. RobGit muestra una confirmación y copia todos los bytes del repositorio privado, incluidos `.git`, archivos ocultos, trabajo sin commit, archivos no rastreados y commits locales. Rechaza enlaces simbólicos. Verifica estructura, tamaños y SHA-256 de todos los archivos, además de HEAD, rama, origin, tracking, relación de commits y estado Git. Después renombra el temporal, repite la verificación, actualiza `repositories.properties` mediante escritura temporal sincronizada y reemplazo atómico cuando el sistema lo permite, abre el nuevo workspace y ejecuta un análisis. Un journal privado en `filesDir/migrations/` registra las fases y permite reanudar explícitamente una interrupción. El directorio privado original permanece intacto como backup; RobGit no lo elimina ni lo usa como fallback automático.
 
-El menú superior reúne el análisis manual, los detalles técnicos y los ajustes de diagnóstico. La conexión con GitHub se gestiona en Ajustes mediante OAuth. Las operaciones Git obtienen automáticamente un access token válido cuando hay sesión; la lectura de repositorios públicos también puede funcionar de forma anónima. El mensaje de cambio se solicita al subir. La interfaz del Asistente RobGit ya permite escoger una orden y escribir una pregunta, pero **la IA todavía no está conectada** y no realiza ninguna llamada de red.
+El menú superior reúne el análisis manual, los detalles técnicos y los ajustes de diagnóstico. La conexión con GitHub se gestiona en Ajustes mediante OAuth con PKCE. Las operaciones Git usan OAuth y obtienen automáticamente un access token válido cuando hay sesión; no existe un flujo PAT manual de producción. La lectura de repositorios públicos también puede funcionar de forma anónima. El mensaje de cambio se solicita al subir, después de comprobar que hay una sesión OAuth válida o recuperable. La interfaz del Asistente RobGit ya permite escoger una orden y escribir una pregunta, pero **la IA todavía no está conectada** y no realiza ninguna llamada de red.
 
 ## Diseño adaptable
 
@@ -38,7 +38,7 @@ La APK queda en `app/build/outputs/apk/debug/app-debug.apk`.
 
 **PRUEBA PUSH AUTENTICADO** usa exclusivamente `robdor80/Robgit.pruebas` y la conexión OAuth de Ajustes. La prueba clona, modifica únicamente `robgit_android_test.txt`, crea un commit local, hace `fetch` para comprobar que GitHub no haya avanzado, ejecuta un push normal y consulta `refs/heads/main` para confirmar el commit remoto. Ante un resultado de red dudoso, consulta el remoto una vez y no repite el push.
 
-Los tests JVM comprueban el contenido local dentro del commit, que la prueba no utilice una carpeta ya existente y que los errores autenticados oculten credenciales. Las operaciones remotas no se ejecutan en la suite JVM: deben probarse desde la app en la Galaxy Tab S9+.
+Los tests JVM comprueban el contenido local dentro del commit, que la prueba no utilice una carpeta ya existente y que los errores autenticados oculten credenciales. Las operaciones remotas no se ejecutan en la suite JVM; PULL, PUSH y SINCRONIZAR, incluidos los casos autenticados descritos en este README, se han validado físicamente desde la app.
 
 ## Estado del repositorio funcional
 
@@ -58,10 +58,10 @@ La suite JVM incluye escenarios deterministas con remotos Git locales para un co
 
 Antes del push realiza un segundo `fetch` y bloquea la operación si GitHub cambió. El push se limita a `refs/heads/<rama configurada>:refs/heads/<rama configurada>`, con force desactivado. Un rechazo conserva todo el trabajo local. Si la respuesta del push es ambigua, realiza una única comprobación remota y nunca reintenta automáticamente.
 
-El access token OAuth se obtiene al iniciar la operación remota y se entrega temporalmente a JGit; no se guarda en el registro de repositorios, archivos Git, logs ni mensajes de error. Los tests de SUBIR utilizan exclusivamente repositorios bare locales y cubren staging, commits existentes, carreras remotas, rechazos non-fast-forward, credenciales, fallos de fetch y respuestas ambiguas. El Hito 6 todavía requiere validación física en la Galaxy Tab S9+.
+El access token OAuth se obtiene al iniciar la operación remota y se entrega temporalmente a JGit; no se guarda en el registro de repositorios, archivos Git, logs ni mensajes de error. Los tests de SUBIR utilizan exclusivamente repositorios bare locales y cubren staging, commits existentes, carreras remotas, rechazos non-fast-forward, credenciales, fallos de fetch y respuestas ambiguas. El PUSH se ha validado físicamente con repositorios públicos y privados, incluida la desconexión OAuth, el bloqueo seguro del PUSH sin sesión y la reconexión seguida de un PUSH.
 
 ## Sincronización segura
 
 **↕ SINCRONIZAR** es el flujo principal conservador. Siempre hace `fetch` y recalcula el estado real antes de decidir: si ya está sincronizado no actúa; si GitHub está adelantado y el árbol está limpio delega en DESCARGAR; si solo hay trabajo local delega en SUBIR. Cada ejecución realiza como máximo una de esas operaciones, nunca ambas.
 
-Si hay cambios en este dispositivo y en GitHub, divergencia, conflictos o fallo de fetch, se bloquea sin intentar merge, rebase, reset ni resolución automática. Los repositorios privados requieren una conexión OAuth válida. La validación física multi-repositorio de este hito queda pendiente.
+Si hay cambios en este dispositivo y en GitHub, divergencia, conflictos o fallo de fetch, se bloquea sin intentar merge, rebase, reset ni resolución automática. Los repositorios privados requieren una conexión OAuth válida. SINCRONIZAR se ha validado físicamente, al igual que el uso de múltiples repositorios y el workspace compartido de producción. También se han validado físicamente la lectura pública y el fetch/análisis de un repositorio privado.
