@@ -153,8 +153,10 @@ class SharedWorkspaceProbe(
 
 internal fun resolveRobGitDocumentsRoot(documentsDirectory: File): File {
     val documents = documentsDirectory.canonicalFile
-    val root = File(documents, "RobGit").canonicalFile
-    require(root.parentFile == documents) { "La raíz del workspace debe permanecer dentro de Documents." }
+    val candidate = File(documents, "RobGit")
+    require(!Files.isSymbolicLink(candidate.toPath())) { "La raíz del workspace no puede ser un enlace simbólico." }
+    val root = candidate.canonicalFile
+    require(root.parentFile == documents && root.name == "RobGit") { "La raíz del workspace debe permanecer dentro de Documents." }
     return root
 }
 

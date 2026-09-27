@@ -4,11 +4,17 @@ La pantalla principal de RobGit presenta el estado del repositorio en castellano
 
 ## Mis repositorios
 
-El selector permite añadir y elegir repositorios GitHub con nombre, URL HTTPS y rama configurables. Un registro persistente en el almacenamiento privado de la app guarda la lista y la selección, sin credenciales. La primera apertura migra automáticamente `Robgit.pruebas` y reutiliza `filesDir/repos/robgit-pruebas` si ya existe. Cada repositorio nuevo recibe un directorio interno propio con identificador seguro bajo `filesDir/repos/`.
+El selector permite añadir y elegir repositorios GitHub con nombre, URL HTTPS y rama configurables. Un registro persistente en el almacenamiento privado de la app guarda la lista, la selección y la ubicación de cada workspace, sin credenciales. La primera apertura incorpora `Robgit.pruebas` y reutiliza `filesDir/repos/robgit-pruebas` si ya existe. Los registros anteriores a Hito 10C se interpretan como `APP_PRIVATE` sin mover sus archivos. Cada repositorio nuevo utiliza `SHARED_DOCUMENTS` bajo `Documents/RobGit/<nombre-seguro>-<id-corto>`.
 
-En Ajustes se pueden consultar las configuraciones y quitarlas de la lista; esta acción conserva todos los archivos locales. Los repositorios siguen en el almacenamiento privado de la app. Un workspace externo mediante SAF queda pendiente para una fase posterior.
+En Ajustes se pueden consultar las configuraciones, su ubicación y quitarlas de la lista; esta acción conserva todos los archivos locales, tanto privados como compartidos. Los repositorios existentes permanecen privados hasta que el usuario elija **MOVER AL WORKSPACE COMPARTIDO**. El acceso compartido utiliza `MANAGE_EXTERNAL_STORAGE` y archivos `java.io.File`; no se utiliza SAF. Si se revoca el permiso, RobGit bloquea ese repositorio y ofrece **CONCEDER ACCESO** sin volver a utilizar el backup privado.
 
-El menú superior reúne el análisis manual, los detalles técnicos y los ajustes de diagnóstico. El PAT se solicita al subir o cuando un repositorio privado lo requiere para preparar, analizar, descargar o sincronizar; el mensaje de cambio solo aparece para una subida. El token vive exclusivamente en memoria. La interfaz del Asistente RobGit ya permite escoger una orden y escribir una pregunta, pero **la IA todavía no está conectada** y no realiza ninguna llamada de red.
+## Workspace compartido y migración
+
+La raíz de producción es `Documents/RobGit/`. Los repositorios nuevos se preparan allí mediante un clone a una carpeta temporal, verificación y traslado a su carpeta definitiva. No se clona encima de una carpeta existente. El diagnóstico **PRUEBA WORKSPACE COMPARTIDO** del Hito 10B sigue disponible en Ajustes y conserva su carpeta de prueba independiente.
+
+La migración de un repositorio antiguo es manual. RobGit muestra una confirmación y copia todos los bytes del repositorio privado, incluidos `.git`, archivos ocultos, trabajo sin commit, archivos no rastreados y commits locales. Rechaza enlaces simbólicos. Verifica estructura, tamaños y SHA-256 de todos los archivos, además de HEAD, rama, origin, tracking, relación de commits y estado Git. Después renombra el temporal, repite la verificación, actualiza `repositories.properties` mediante escritura temporal sincronizada y reemplazo atómico cuando el sistema lo permite, abre el nuevo workspace y ejecuta un análisis. Un journal privado en `filesDir/migrations/` registra las fases y permite reanudar explícitamente una interrupción. El directorio privado original permanece intacto como backup; RobGit no lo elimina ni lo usa como fallback automático.
+
+El menú superior reúne el análisis manual, los detalles técnicos y los ajustes de diagnóstico. El PAT se solicita al subir o cuando GitHub lo requiere para preparar, analizar, descargar, sincronizar o completar una migración; el mensaje de cambio solo aparece para una subida. El token vive exclusivamente en memoria. La autenticación moderna de GitHub queda pendiente para el Hito 11. La interfaz del Asistente RobGit ya permite escoger una orden y escribir una pregunta, pero **la IA todavía no está conectada** y no realiza ninguna llamada de red.
 
 ## Diseño adaptable
 
@@ -21,7 +27,7 @@ Este proyecto valida en Android operaciones Git seguras mediante Eclipse JGit 7.
 Se necesitan Android SDK 36, JDK 17 y Android API 33 o superior en el dispositivo. Desde la raíz del repositorio:
 
 ```powershell
-.\gradlew.bat :app:testDebugUnitTest :app:assembleDebug
+.\gradlew.bat test lint assembleDebug
 ```
 
 La APK queda en `app/build/outputs/apk/debug/app-debug.apk`.
@@ -36,7 +42,7 @@ Los tests JVM comprueban el contenido local dentro del commit, que la prueba no 
 
 ## Estado del repositorio funcional
 
-Cada repositorio configurado se prepara en su propio directorio privado. El repositorio original `Robgit.pruebas` conserva `filesDir/repos/robgit-pruebas`. Si una carpeta ya existe, RobGit verifica remoto y rama y no clona encima ni elimina su contenido.
+Cada repositorio configurado se prepara en su ubicación registrada. El repositorio original `Robgit.pruebas` conserva `filesDir/repos/robgit-pruebas` hasta una migración manual. Si una carpeta ya existe, RobGit verifica remoto y rama y no clona encima ni elimina su contenido.
 
 **ANALIZAR AHORA** realiza primero un `fetch` y después calcula la relación real del grafo entre `HEAD` y la rama remota configurada: sincronizado, local adelantado, remoto adelantado o divergente, con el número de commits exclusivos de cada lado. El working tree se representa por separado mediante archivos nuevos, modificados, eliminados, staged y en conflicto. Si el fetch falla, el resultado es `ERROR` y nunca se presenta como sincronizado.
 

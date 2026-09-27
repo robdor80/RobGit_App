@@ -1,9 +1,13 @@
 package es.robertodorado.robgit
 
 import java.io.File
+import java.io.FileOutputStream
 import java.net.URI
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+import java.text.Normalizer
+import java.util.Locale
 import java.util.Properties
 import java.util.UUID
 
@@ -13,7 +17,25 @@ data class RepositoryConfig(
     val remoteUrl: String,
     val branch: String,
     val localDirectoryName: String,
+    val workspaceLocation: WorkspaceLocation = WorkspaceLocation.APP_PRIVATE,
 )
+
+enum class WorkspaceLocation { APP_PRIVATE, SHARED_DOCUMENTS }
+
+internal fun sharedDirectoryName(displayName: String, id: String, suffixLength: Int = 12): String {
+    require(suffixLength in 12..64)
+    val slug = Normalizer.normalize(displayName, Normalizer.Form.NFD)
+        .replace(Regex("\\p{M}+"), "")
+        .lowercase(Locale.ROOT)
+        .replace(Regex("[^a-z0-9]+"), "-")
+        .trim('-')
+        .take(32)
+        .trimEnd('-')
+        .ifEmpty { "repo" }
+    val digest = MessageDigest.getInstance("SHA-256").digest(id.toByteArray(Charsets.UTF_8))
+        .joinToString("") { "%02x".format(it) }
+    return "$slug-${digest.take(suffixLength)}"
+}
 
 data class RepositoryCatalog(
     val repositories: List<RepositoryConfig>,
@@ -23,7 +45,8 @@ data class RepositoryCatalog(
 }
 
 /** Only repository metadata is stored here. Credentials never enter this model or file. */
-class RepositoryRegistry(private val file: File, private val repositoriesRoot: File) {
+class RepositoryRegistry(private val file: File, private val repositoriesRoot: File,
+    private val beforeReplace: () -> Unit = {}) {
     private val directoryPattern = Regex("repo-[a-f0-9]{32}")
     private val branchPattern = Regex("[A-Za-z0-9][A-Za-z0-9._/-]*")
     private val namePattern = Regex("[A-Za-z0-9_.-]+")
@@ -50,10 +73,13 @@ class RepositoryRegistry(private val file: File, private val repositoriesRoot: F
                 remoteUrl = requireNotNull(properties.getProperty("$index.url")),
                 branch = requireNotNull(properties.getProperty("$index.branch")),
                 localDirectoryName = requireNotNull(properties.getProperty("$index.directory")),
+                workspaceLocation = properties.getProperty("$index.workspaceLocation")?.let {
+                    runCatching { WorkspaceLocation.valueOf(it) }.getOrElse { error("Ubicación de workspace no válida.") }
+                } ?: WorkspaceLocation.APP_PRIVATE,
             ).also(::validateStored)
         }
         require(repositories.map { it.id }.toSet().size == repositories.size &&
-            repositories.map { it.localDirectoryName }.toSet().size == repositories.size &&
+            repositories.map { it.workspaceLocation to it.localDirectoryName.lowercase(Locale.ROOT) }.toSet().size == repositories.size &&
             repositories.map { it.remoteUrl.lowercase() to it.branch }.toSet().size == repositories.size
         ) { "El registro contiene repositorios duplicados." }
         val selectedId = properties.getProperty("selected")?.takeIf { selected ->
@@ -72,7 +98,12 @@ class RepositoryRegistry(private val file: File, private val repositoriesRoot: F
             "Este repositorio ya está configurado en RobGit."
         }
         val id = UUID.randomUUID().toString().replace("-", "")
-        val config = RepositoryConfig(id, displayName, remoteUrl, normalizedBranch, "repo-$id")
+        val name = (12..64).asSequence().map { sharedDirectoryName(displayName, id, it) }
+            .first { candidate -> current.repositories.none {
+                it.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS &&
+                    it.localDirectoryName.equals(candidate, ignoreCase = true)
+            } }
+        val config = RepositoryConfig(id, displayName, remoteUrl, normalizedBranch, name, WorkspaceLocation.SHARED_DOCUMENTS)
         return RepositoryCatalog(current.repositories + config, config.id).also(::save)
     }
 
@@ -91,21 +122,39 @@ class RepositoryRegistry(private val file: File, private val repositoriesRoot: F
         return RepositoryCatalog(remaining, selected).also(::save)
     }
 
+    @Synchronized fun activateShared(id: String, expectedPrivateDirectory: String, sharedDirectory: String): RepositoryCatalog {
+        val current = load()
+        val old = current.repositories.firstOrNull { it.id == id } ?: error("Repositorio desconocido.")
+        check(old.workspaceLocation == WorkspaceLocation.APP_PRIVATE && old.localDirectoryName == expectedPrivateDirectory) {
+            "La ubicación del repositorio cambió durante la migración."
+        }
+        val updated = old.copy(localDirectoryName = sharedDirectory, workspaceLocation = WorkspaceLocation.SHARED_DOCUMENTS)
+        validateStored(updated)
+        check(current.repositories.none { it.id != id && it.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS &&
+            it.localDirectoryName.equals(sharedDirectory, ignoreCase = true) }) { "El directorio compartido está asignado a otro repositorio." }
+        return current.copy(repositories = current.repositories.map { if (it.id == id) updated else it }).also(::save)
+    }
+
     fun directoryFor(config: RepositoryConfig): File {
         validateStored(config)
-        val root = repositoriesRoot.canonicalFile
-        val child = File(root, config.localDirectoryName).canonicalFile
-        require(child.parentFile == root) { "Directorio local no permitido." }
-        return child
+        require(config.workspaceLocation == WorkspaceLocation.APP_PRIVATE) { "El repositorio utiliza el workspace compartido." }
+        return RepositoryWorkspaceResolver(repositoriesRoot, repositoriesRoot) { false }.resolve(config)
     }
 
     private fun validateStored(config: RepositoryConfig) {
         require(config.displayName.isNotBlank()) { "Nombre de repositorio no válido." }
         require(normalizeGitHubUrl(config.remoteUrl) == config.remoteUrl) { "URL guardada no válida." }
         require(validateBranch(config.branch) == config.branch) { "Rama guardada no válida." }
-        require(config.localDirectoryName == "robgit-pruebas" && config.id == "legacy-robgit-pruebas" ||
-            config.localDirectoryName.matches(directoryPattern) && config.id.matches(Regex("[a-f0-9]{32}")) &&
-                config.localDirectoryName == "repo-${config.id}") { "Directorio local no permitido." }
+        val validId = config.id == "legacy-robgit-pruebas" || config.id.matches(Regex("[a-f0-9]{32}"))
+        val validDirectory = when (config.workspaceLocation) {
+            WorkspaceLocation.APP_PRIVATE -> config.localDirectoryName == "robgit-pruebas" && config.id == "legacy-robgit-pruebas" ||
+                config.localDirectoryName.matches(directoryPattern) && config.id.matches(Regex("[a-f0-9]{32}")) &&
+                    config.localDirectoryName == "repo-${config.id}"
+            WorkspaceLocation.SHARED_DOCUMENTS -> validId && (12..64).any {
+                config.localDirectoryName == sharedDirectoryName(config.displayName, config.id, it)
+            }
+        }
+        require(validDirectory) { "Directorio local no permitido." }
     }
 
     private fun save(catalog: RepositoryCatalog) {
@@ -119,16 +168,17 @@ class RepositoryRegistry(private val file: File, private val repositoriesRoot: F
                 setProperty("$index.url", config.remoteUrl)
                 setProperty("$index.branch", config.branch)
                 setProperty("$index.directory", config.localDirectoryName)
+                setProperty("$index.workspaceLocation", config.workspaceLocation.name)
             }
         }
         val temporary = File(file.parentFile, "${file.name}.${UUID.randomUUID()}.tmp")
         try {
-            temporary.outputStream().use { values.store(it, "RobGit repositories; no credentials") }
-            try {
-                Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
-            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
-                Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            FileOutputStream(temporary).use { stream ->
+                values.store(stream, "RobGit repositories; no credentials")
+                stream.fd.sync()
             }
+            beforeReplace()
+            Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
         } finally {
             temporary.delete()
         }

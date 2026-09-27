@@ -65,10 +65,17 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         val diagnosticRoot = File(filesDir, "diagnostics")
         val registry = RepositoryRegistry(File(filesDir, "repositories.properties"), File(filesDir, "repos"))
+        @Suppress("DEPRECATION")
+        val documents = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+        val workspaceResolver = RepositoryWorkspaceResolver(File(filesDir, "repos"), documents) {
+            Environment.isExternalStorageManager()
+        }
+        val migrationManager = RepositoryMigrationManager(registry, workspaceResolver, File(filesDir, "migrations"))
         setContent {
             RobGitTheme {
                 RobGitScreen(
-                    diagnosticRoot, remember { GitRepositoryService() }, registry, foregroundReturn,
+                    diagnosticRoot, remember { GitRepositoryService() }, registry, workspaceResolver,
+                    migrationManager, foregroundReturn,
                 )
             }
         }
@@ -85,7 +92,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class AuthPurpose { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, WORKSPACE_PREPARE, WORKSPACE_ANALYZE, WORKSPACE_PULL, WORKSPACE_PUSH, WORKSPACE_SYNCHRONIZE, DIAGNOSTIC }
+private enum class AuthPurpose { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, MIGRATION, WORKSPACE_PREPARE, WORKSPACE_ANALYZE, WORKSPACE_PULL, WORKSPACE_PUSH, WORKSPACE_SYNCHRONIZE, DIAGNOSTIC }
 private enum class SharedWorkspaceAction { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, FILESYSTEM }
 
 @Composable
@@ -93,12 +100,13 @@ private fun RobGitScreen(
     diagnosticRoot: File,
     gitService: GitRepositoryService,
     registry: RepositoryRegistry,
+    workspaceResolver: RepositoryWorkspaceResolver,
+    migrationManager: RepositoryMigrationManager,
     foregroundReturn: Int,
 ) {
     var catalog by remember { mutableStateOf<RepositoryCatalog?>(null) }
     var uiRepositoryId by rememberSaveable { mutableStateOf<String?>(null) }
     val selectedRepository = catalog?.selected
-    val functionalRepository = selectedRepository?.let(registry::directoryFor)
     val repositoryService = remember(selectedRepository?.id) {
         selectedRepository?.let { RepositoryStateService(repositoryUrl = it.remoteUrl, branch = it.branch) }
     }
@@ -124,6 +132,21 @@ private fun RobGitScreen(
     var sharedWorkspaceResult by remember { mutableStateOf<SharedWorkspaceResult?>(null) }
     var activeWorkspaceOperation by remember { mutableStateOf<String?>(null) }
     var hasAllFilesAccess by remember { mutableStateOf(Environment.isExternalStorageManager()) }
+    var pendingMigrations by remember { mutableStateOf<List<MigrationRecord>?>(null) }
+    var migrationJournalError by remember { mutableStateOf<String?>(null) }
+    var confirmMigration by remember { mutableStateOf<RepositoryConfig?>(null) }
+    var migrationDialogVisible by remember { mutableStateOf(false) }
+    var migrationDialogError by remember { mutableStateOf<String?>(null) }
+    var migrationPhase by remember { mutableStateOf<MigrationPhase?>(null) }
+    var migrationTargetId by remember { mutableStateOf<String?>(null) }
+    val selectedPendingMigration = pendingMigrations?.firstOrNull { it.repositoryId == selectedRepository?.id }
+    val sharedAccessMissing = selectedRepository?.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS &&
+        !Environment.isExternalStorageManager()
+    val workspaceResolution = selectedRepository?.takeIf {
+        pendingMigrations != null && migrationJournalError == null && selectedPendingMigration == null
+    }?.let { runCatching { workspaceResolver.resolve(it) } }
+    val functionalRepository = workspaceResolution?.getOrNull()
+    val workspaceResolutionError = workspaceResolution?.exceptionOrNull()?.message
     val context = LocalContext.current
     @Suppress("DEPRECATION")
     val documentsDirectory = remember(context) {
@@ -207,6 +230,10 @@ private fun RobGitScreen(
 
     LaunchedEffect(Unit) {
         val loaded = withContext(Dispatchers.IO) { registry.load() }
+        val migrations = withContext(Dispatchers.IO) { runCatching { migrationManager.pending() } }
+        migrations.onSuccess { pendingMigrations = it }.onFailure {
+            migrationJournalError = "El registro de una migración está dañado. RobGit ha bloqueado las operaciones para proteger tus repositorios."
+        }
         if (repositorySelectionNeedsReset(uiRepositoryId, loaded.selectedRepositoryId)) {
             repositoryPrepared = null
             repositoryState = null
@@ -223,11 +250,62 @@ private fun RobGitScreen(
     fun setNotice(title: String, body: String, recommendation: String? = null) {
         noticeTitle = title; noticeBody = body; noticeRecommendation = recommendation
     }
+    fun operationDirectory(): File? {
+        val config = selectedRepository ?: return null
+        if (pendingMigrations == null || selectedPendingMigration != null || migrationJournalError != null) return null
+        return try { workspaceResolver.resolve(config) } catch (failure: Exception) {
+            setNotice("No se puede acceder al workspace de este repositorio.", failure.message.orEmpty())
+            null
+        }
+    }
     fun clearRepositoryUi() {
         repositoryPrepared = null
         repositoryState = null
         lastOperation = null
         clearNotice()
+    }
+    fun runMigration(config: RepositoryConfig, token: CharArray = charArrayOf()) {
+        if (runningOperation != null || migrationJournalError != null) { token.fill('\u0000'); return }
+        if (!hasAllFilesAccess) {
+            token.fill('\u0000')
+            migrationPhase = null
+            migrationDialogError = "RobGit necesita acceso al workspace compartido para migrar este repositorio."
+            migrationDialogVisible = true
+            return
+        }
+        migrationTargetId = config.id
+        migrationDialogVisible = true
+        migrationDialogError = null
+        migrationPhase = MigrationPhase.PLANNED
+        runningOperation = "migrando"
+        scope.launch {
+            try {
+                val completed = withContext(Dispatchers.IO) {
+                    var analyzed: RepositoryStateSnapshot? = null
+                    migrationManager.migrate(config.id, token, onAnalyzed = { analyzed = it }) { phase ->
+                        scope.launch { if (migrationPhase != MigrationPhase.COMPLETED) migrationPhase = phase }
+                    }
+                    Triple(analyzed, registry.load(), migrationManager.pending())
+                }
+                clearRepositoryUi()
+                catalog = completed.second
+                pendingMigrations = completed.third
+                repositoryPrepared = completed.first?.let { true }
+                repositoryState = completed.first
+                lastOperation = RestoredOperation("MIGRACIÓN", "OK", "Workspace compartido activado y analizado.", null)
+                migrationPhase = MigrationPhase.COMPLETED
+            } catch (failure: Exception) {
+                if (failure is kotlinx.coroutines.CancellationException) throw failure
+                hasAllFilesAccess = Environment.isExternalStorageManager()
+                migrationDialogError = failure.message ?: "La migración se detuvo. La copia privada permanece intacta."
+                if (failure is MigrationAuthenticationRequiredException) authPurpose = AuthPurpose.MIGRATION
+                runCatching { withContext(Dispatchers.IO) { registry.load() } }.onSuccess { catalog = it }
+                runCatching { withContext(Dispatchers.IO) { migrationManager.pending() } }.onSuccess { pendingMigrations = it }
+            } finally {
+                token.fill('\u0000')
+                runningOperation = null
+            }
+        }
     }
     fun selectRepository(id: String) {
         if (!repositorySelectorEnabled(runningOperation) || selectedRepository?.id == id) return
@@ -265,7 +343,7 @@ private fun RobGitScreen(
     }
     fun analyze(token: CharArray = charArrayOf()) {
         val suppliedToken = token.isNotEmpty()
-        val directory = functionalRepository ?: return
+        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
         val service = repositoryService ?: return
         if (runningOperation != null || repositoryPrepared != true) return
         runningOperation = "analizando"; clearNotice()
@@ -283,7 +361,7 @@ private fun RobGitScreen(
     }
     fun prepareRepository(token: CharArray = charArrayOf()) {
         val suppliedToken = token.isNotEmpty()
-        val directory = functionalRepository ?: return
+        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
         val service = repositoryService ?: return
         if (runningOperation != null) return
         runningOperation = "preparando"; clearNotice()
@@ -309,7 +387,7 @@ private fun RobGitScreen(
     }
     fun pull(token: CharArray = charArrayOf()) {
         val suppliedToken = token.isNotEmpty()
-        val directory = functionalRepository ?: return
+        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
         val service = repositoryService ?: return
         if (runningOperation != null) return
         runningOperation = "PULL"; clearNotice()
@@ -327,7 +405,7 @@ private fun RobGitScreen(
         }
     }
     fun upload(token: CharArray, commitMessage: String) {
-        val directory = functionalRepository ?: return
+        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
         val service = repositoryService ?: return
         runningOperation = "PUSH"; clearNotice()
         scope.launch {
@@ -342,7 +420,7 @@ private fun RobGitScreen(
     }
     fun synchronize(token: CharArray = charArrayOf(), commitMessage: String = "Cambios desde RobGit") {
         val suppliedToken = token.isNotEmpty()
-        val directory = functionalRepository ?: return
+        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
         val service = repositoryService ?: return
         runningOperation = "SINCRONIZAR"; clearNotice()
         scope.launch {
@@ -359,8 +437,10 @@ private fun RobGitScreen(
         }
     }
 
-    LaunchedEffect(selectedRepository?.id) {
-        val directory = functionalRepository
+    LaunchedEffect(selectedRepository?.id, selectedRepository?.workspaceLocation, hasAllFilesAccess, pendingMigrations) {
+        val directory = selectedRepository?.takeIf { pendingMigrations != null &&
+            pendingMigrations?.none { pending -> pending.repositoryId == it.id } == true && migrationJournalError == null
+        }?.let { runCatching { workspaceResolver.resolve(it) }.getOrNull() }
         val service = repositoryService
         if (directory != null && service != null && repositoryPrepared == null) {
             runningOperation = "analizando"
@@ -374,18 +454,45 @@ private fun RobGitScreen(
             } finally { runningOperation = null }
         }
     }
-    LaunchedEffect(foregroundReturn) { if (foregroundReturn > 0 && repositoryPrepared == true) analyze() }
+    LaunchedEffect(foregroundReturn) {
+        if (foregroundReturn > 0) {
+            hasAllFilesAccess = Environment.isExternalStorageManager()
+            if (repositoryPrepared == true) analyze()
+        }
+    }
 
     val baseStatus = when {
+        migrationJournalError != null -> RepositoryHumanStatus("Migración pendiente de revisión.",
+            requireNotNull(migrationJournalError), blocked = true)
+        selectedPendingMigration != null -> RepositoryHumanStatus("Migración pendiente de completar.",
+            "La copia privada sigue protegida. Reanuda la migración antes de utilizar este repositorio.", blocked = true)
+        sharedAccessMissing -> RepositoryHumanStatus("Workspace compartido sin acceso.",
+            "RobGit necesita acceso al workspace compartido para utilizar este repositorio.", blocked = true)
+        workspaceResolutionError != null -> RepositoryHumanStatus("Workspace no disponible.",
+            "RobGit no puede acceder al workspace de este repositorio. ${workspaceResolutionError}", blocked = true)
         catalog != null && selectedRepository == null -> RepositoryStatusPresenter.noRepositories
         repositoryPrepared == false -> RepositoryStatusPresenter.notPrepared
         repositoryState != null -> RepositoryStatusPresenter.present(requireNotNull(repositoryState))
         else -> RepositoryStatusPresenter.analyzing
     }
     val displayedStatus = when {
+        runningOperation == "migrando" -> RepositoryHumanStatus("Migrando repositorio…",
+            migrationPhase?.humanLabel() ?: "Preparando…", blocked = true)
+        migrationJournalError != null || selectedPendingMigration != null || sharedAccessMissing || workspaceResolutionError != null -> baseStatus
         runningOperation == "analizando" -> RepositoryStatusPresenter.analyzing
         noticeTitle != null -> RepositoryHumanStatus(requireNotNull(noticeTitle), noticeBody.orEmpty(), noticeRecommendation)
         else -> baseStatus
+    }
+    val supportActionLabel = when {
+        migrationJournalError != null -> null
+        selectedPendingMigration != null && !hasAllFilesAccess -> "CONCEDER ACCESO"
+        selectedPendingMigration != null -> "REANUDAR MIGRACIÓN"
+        sharedAccessMissing -> "CONCEDER ACCESO"
+        else -> null
+    }
+    val supportAction: () -> Unit = {
+        if (supportActionLabel == "CONCEDER ACCESO") requestWorkspaceAccess()
+        else selectedRepository?.let(::runMigration)
     }
 
     Surface(color = RobGitColors.Petroleum, modifier = Modifier.fillMaxSize()) {
@@ -401,18 +508,18 @@ private fun RobGitScreen(
                         Row(horizontalArrangement = Arrangement.spacedBy(28.dp), modifier = Modifier.fillMaxWidth()) {
                             Column(Modifier.weight(1.15f)) {
                                 RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
-                                HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true })
+                                HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
                             }
-                            ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, { pull() },
+                            ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
                                 { authPurpose = AuthPurpose.PUSH },
                                 { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
                                 { showAi = true }, Modifier.weight(.85f))
                         }
                     } else {
                         RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
-                        HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true })
+                        HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
                         Spacer(Modifier.height(if (tablet) 28.dp else 22.dp))
-                        ActionGrid(baseStatus, repositoryPrepared == true && runningOperation == null, { pull() },
+                        ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
                             { authPurpose = AuthPurpose.PUSH },
                             { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
                             { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp))
@@ -426,13 +533,25 @@ private fun RobGitScreen(
         if (showSettings) {
             preparedRepositories = withContext(Dispatchers.IO) {
                 catalog?.repositories?.associate { config ->
-                    config.id to RepositoryStateService(repositoryUrl = config.remoteUrl, branch = config.branch)
-                        .isPrepared(registry.directoryFor(config))
+                    config.id to runCatching {
+                        RepositoryStateService(repositoryUrl = config.remoteUrl, branch = config.branch)
+                            .isPrepared(workspaceResolver.resolve(config))
+                    }.getOrDefault(false)
                 }.orEmpty()
             }
         }
     }
-    if (showTechnical) TechnicalDetailsDialog(selectedRepository, functionalRepository, repositoryState, lastOperation) { showTechnical = false }
+    val technicalDirectory = functionalRepository ?: selectedRepository?.let {
+        runCatching { File(workspaceResolver.rootFor(it.workspaceLocation), it.localDirectoryName) }.getOrNull()
+    }
+    val backupDirectory = remember(selectedRepository?.id, selectedRepository?.workspaceLocation, pendingMigrations) {
+        selectedRepository?.id?.let { id ->
+            runCatching { migrationManager.receipt(id) }.getOrNull()?.let { receipt ->
+                File(workspaceResolver.rootFor(WorkspaceLocation.APP_PRIVATE), receipt.sourceDirectory)
+            }
+        }
+    }
+    if (showTechnical) TechnicalDetailsDialog(selectedRepository, technicalDirectory, backupDirectory, repositoryState, lastOperation) { showTechnical = false }
     if (showAi) AiAssistantDialog { showAi = false }
     if (showAddRepository) AddRepositoryDialog(
         error = addError,
@@ -444,7 +563,9 @@ private fun RobGitScreen(
         AlertDialog(
             onDismissRequest = { pendingRemoval = null; showSettings = true },
             title = { Text("Quitar de RobGit") },
-            text = { Text("Se quitará este repositorio de la lista de RobGit. Sus archivos locales no serán eliminados.") },
+            text = { Text(if (config.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS)
+                "Se quitará este repositorio de RobGit. Su carpeta en Documents/RobGit permanecerá intacta."
+                else "Se quitará este repositorio de RobGit. Su carpeta privada permanecerá intacta.") },
             confirmButton = { TextButton(onClick = {
                 if (runningOperation != null) return@TextButton
                 runningOperation = "quitando"
@@ -467,6 +588,37 @@ private fun RobGitScreen(
             dismissButton = { TextButton(onClick = { pendingRemoval = null; showSettings = true }) { Text("CANCELAR") } },
         )
     }
+    confirmMigration?.let { config ->
+        AlertDialog(
+            onDismissRequest = { confirmMigration = null; showSettings = true },
+            title = { Text(if (pendingMigrations?.any { it.repositoryId == config.id } == true)
+                "Reanudar migración" else "Mover al workspace compartido") },
+            text = { Text("RobGit copiará el repositorio completo a Documents/RobGit y comprobará la copia antes de utilizarla. La copia privada original NO se eliminará.") },
+            confirmButton = {
+                if (!hasAllFilesAccess) TextButton(onClick = ::requestWorkspaceAccess) { Text("CONCEDER ACCESO") }
+                else Button(onClick = { confirmMigration = null; runMigration(config) }) { Text("CONTINUAR") }
+            },
+            dismissButton = { TextButton(onClick = { confirmMigration = null; showSettings = true }) { Text("CANCELAR") } },
+        )
+    }
+    if (migrationDialogVisible) AlertDialog(
+        onDismissRequest = { if (runningOperation != "migrando") migrationDialogVisible = false },
+        title = { Text("Migración del repositorio") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (runningOperation == "migrando") CircularProgressIndicator(Modifier.size(24.dp))
+                Text(migrationPhase?.humanLabel() ?: "Preparando…")
+                migrationDialogError?.let { Text(it, color = RobGitColors.Warning) }
+                if (migrationPhase == MigrationPhase.COMPLETED) Text("El workspace compartido está activo. La copia privada permanece como backup.")
+            }
+        },
+        confirmButton = {
+            if (runningOperation != "migrando") TextButton(onClick = { migrationDialogVisible = false }) { Text("CERRAR") }
+        },
+        dismissButton = {
+            if (runningOperation != "migrando" && !hasAllFilesAccess) TextButton(onClick = ::requestWorkspaceAccess) { Text("CONCEDER ACCESO") }
+        },
+    )
     if (showSharedWorkspace) SharedWorkspaceDiagnosticDialog(
         permissionGranted = hasAllFilesAccess,
         rootPath = sharedWorkspaceProbe.rootDirectory.absolutePath,
@@ -487,8 +639,10 @@ private fun RobGitScreen(
         },
         onDismiss = { showSharedWorkspace = false; sharedWorkspaceResult = null; activeWorkspaceOperation = null },
     )
-    if (showSettings) SettingsDialog(runningOperation, catalog, preparedRepositories, localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
+    if (showSettings) SettingsDialog(runningOperation, catalog, preparedRepositories, pendingMigrations.orEmpty(), hasAllFilesAccess,
+        migrationJournalError != null, localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
         { config -> showSettings = false; pendingRemoval = config },
+        { config -> showSettings = false; confirmMigration = config },
         {
             runningOperation = "diagnóstico local"; scope.launch {
                 localDiagnostic = withContext(Dispatchers.IO) { gitService.runLocalDiagnostic(File(diagnosticRoot, UUID.randomUUID().toString())) }
@@ -514,6 +668,10 @@ private fun RobGitScreen(
                 AuthPurpose.PULL -> pull(token)
                 AuthPurpose.PUSH -> upload(token, message)
                 AuthPurpose.SYNCHRONIZE -> synchronize(token, message)
+                AuthPurpose.MIGRATION -> {
+                    val config = catalog?.repositories?.firstOrNull { it.id == migrationTargetId }
+                    if (config != null) runMigration(config, token) else token.fill('\u0000')
+                }
                 AuthPurpose.WORKSPACE_PREPARE -> runSharedWorkspace(SharedWorkspaceAction.PREPARE, token, message)
                 AuthPurpose.WORKSPACE_ANALYZE -> runSharedWorkspace(SharedWorkspaceAction.ANALYZE, token, message)
                 AuthPurpose.WORKSPACE_PULL -> runSharedWorkspace(SharedWorkspaceAction.PULL, token, message)
@@ -579,7 +737,7 @@ private fun RepositorySelector(
 }
 
 @Composable
-private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, notPrepared: Boolean, noRepositories: Boolean, onPrepare: () -> Unit, onAdd: () -> Unit) {
+private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, notPrepared: Boolean, noRepositories: Boolean, onPrepare: () -> Unit, onAdd: () -> Unit, supportActionLabel: String? = null, onSupportAction: () -> Unit = {}) {
     TitledFrame(title = "ESTADO DEL REPOSITORIO", modifier = Modifier.fillMaxWidth(), contentColor = RobGitColors.PetroleumDark.copy(alpha = .48f)) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 22.dp, vertical = 20.dp)) {
             AnimatedContent(status.title, label = "estado") { Text(it, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold) }
@@ -588,6 +746,7 @@ private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, no
             if (running) { Spacer(Modifier.height(18.dp)); Row(verticalAlignment = Alignment.CenterVertically) { CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = RobGitColors.Ice); Spacer(Modifier.width(12.dp)); Text("RobGit está trabajando…") } }
             if (notPrepared) { Spacer(Modifier.height(18.dp)); OutlinedButton(onPrepare, modifier = Modifier.fillMaxWidth()) { Text("PREPARAR REPOSITORIO") } }
             if (noRepositories) { Spacer(Modifier.height(18.dp)); OutlinedButton(onAdd, modifier = Modifier.fillMaxWidth()) { Text("AÑADIR REPOSITORIO") } }
+            supportActionLabel?.let { label -> Spacer(Modifier.height(18.dp)); OutlinedButton(onSupportAction, enabled = !running, modifier = Modifier.fillMaxWidth()) { Text(label) } }
         }
     }
 }
@@ -760,14 +919,16 @@ private fun AddRepositoryDialog(
 }
 
 @Composable
-private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, state: RepositoryStateSnapshot?, operation: RestoredOperation?, onDismiss: () -> Unit) {
+private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, backupDirectory: File?, state: RepositoryStateSnapshot?, operation: RestoredOperation?, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Detalles técnicos") }, text = {
-        Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             config?.let {
                 Text("Nombre: ${it.displayName}")
                 Text("URL: ${it.remoteUrl}")
                 Text("Rama configurada: ${it.branch}")
+                Text("Ubicación: ${if (it.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS) "Workspace compartido" else "Privada"}")
                 Text("Directorio local: ${directory?.absolutePath ?: "desconocido"}")
+                backupDirectory?.let { backup -> Text("Backup privado conservado: ${backup.absolutePath}") }
             }
             if (state == null) Text("Todavía no hay un análisis disponible.") else {
                 Text("Rama actual: ${state.branch ?: "desconocida"}"); Text("HEAD: ${state.localHead ?: "desconocido"}"); Text("origin/${config?.branch ?: "?"}: ${state.remoteHead ?: "desconocido"}")
@@ -783,15 +944,21 @@ private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, 
 @Composable private fun TechnicalFiles(label: String, files: Set<String>) { Text("$label (${files.size}): ${if (files.isEmpty()) "—" else files.joinToString()}") }
 
 @Composable
-private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepared: Map<String, Boolean>, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onRemove: (RepositoryConfig) -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit, onSharedWorkspace: () -> Unit) {
+private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepared: Map<String, Boolean>, pending: List<MigrationRecord>, permissionGranted: Boolean, journalBlocked: Boolean, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onRemove: (RepositoryConfig) -> Unit, onMigrate: (RepositoryConfig) -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit, onSharedWorkspace: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Ajustes") }, text = {
-        Column(Modifier.verticalScroll(rememberScrollState()).heightIn(max = 520.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Text("REPOSITORIOS", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
             catalog?.repositories?.forEach { config ->
                 Text(config.displayName, fontWeight = FontWeight.Bold)
                 Text(config.remoteUrl, style = MaterialTheme.typography.bodySmall)
-                Text("Rama: ${config.branch} · ${if (prepared[config.id] == true) "preparado" else "no preparado"}", style = MaterialTheme.typography.bodySmall)
-                TextButton(onClick = { onRemove(config) }, enabled = running == null) { Text("QUITAR DE ROBGIT") }
+                Text("Rama: ${config.branch} · ${if (config.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS && !permissionGranted) "sin acceso" else if (prepared[config.id] == true) "preparado" else "no preparado"}", style = MaterialTheme.typography.bodySmall)
+                Text("Ubicación: ${if (config.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS) "Documents/RobGit" else "Privada"}", style = MaterialTheme.typography.bodySmall)
+                if (config.workspaceLocation == WorkspaceLocation.APP_PRIVATE || pending.any { it.repositoryId == config.id }) {
+                    TextButton(onClick = { onMigrate(config) }, enabled = running == null && !journalBlocked) {
+                        Text(if (pending.any { it.repositoryId == config.id }) "REANUDAR MIGRACIÓN" else "MOVER AL WORKSPACE COMPARTIDO")
+                    }
+                }
+                TextButton(onClick = { onRemove(config) }, enabled = running == null && !journalBlocked && pending.none { it.repositoryId == config.id }) { Text("QUITAR DE ROBGIT") }
             }
             Text("AVANZADO / DIAGNÓSTICO", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
             Button(onSharedWorkspace, enabled = running == null, modifier = Modifier.fillMaxWidth()) { Text("PRUEBA WORKSPACE COMPARTIDO") }
@@ -801,6 +968,16 @@ private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepar
             running?.let { Text("Ejecutando: $it…") }
         }
     }, confirmButton = { TextButton(onDismiss) { Text("CERRAR") } })
+}
+
+private fun MigrationPhase.humanLabel(): String = when (this) {
+    MigrationPhase.PLANNED -> "Preparando…"
+    MigrationPhase.COPYING -> "Copiando archivos…"
+    MigrationPhase.VERIFYING_TEMP -> "Verificando copia temporal…"
+    MigrationPhase.FINALIZING -> "Activando carpeta final…"
+    MigrationPhase.VERIFYING_FINAL -> "Verificando carpeta final…"
+    MigrationPhase.SWITCHING_REGISTRY -> "Activando nuevo workspace y analizando…"
+    MigrationPhase.COMPLETED -> "Completado."
 }
 
 @Composable

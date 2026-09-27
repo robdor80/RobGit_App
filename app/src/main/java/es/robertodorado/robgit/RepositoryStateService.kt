@@ -208,6 +208,7 @@ class RepositoryStateService(
             }
             Files.move(stagingDirectory.toPath(), repositoryDirectory.toPath())
             temporaryDirectory = null
+            check(isPrepared(repositoryDirectory)) { "El repositorio clonado no pudo verificarse en su carpeta definitiva." }
             return RepositoryPreparationResult(
                 success = true,
                 repositoryPath = repositoryDirectory.absolutePath,

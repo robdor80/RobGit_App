@@ -14,6 +14,9 @@ class RepositoryRegistryTest {
         File(folder.root, "repos"),
     )
 
+    private fun resolver(access: Boolean = true) = RepositoryWorkspaceResolver(
+        File(folder.root, "repos"), File(folder.root, "Documents"), { access })
+
     private fun emptyRegistry(): RepositoryRegistry = registry().also {
         it.remove(it.load().selectedRepositoryId!!)
     }
@@ -28,6 +31,7 @@ class RepositoryRegistryTest {
         assertEquals("https://github.com/robdor80/Robgit.pruebas.git", first.selected?.remoteUrl)
         assertEquals("main", first.selected?.branch)
         assertEquals("robgit-pruebas", first.selected?.localDirectoryName)
+        assertEquals(WorkspaceLocation.APP_PRIVATE, first.selected?.workspaceLocation)
     }
 
     @Test fun legacyDirectoryIsReusedWithoutModification() {
@@ -56,6 +60,7 @@ class RepositoryRegistryTest {
         val first = store.add("  Nimroel RPG  ", "https://github.com/owner/nimroel", "main").selected!!
         val second = store.add("Cuadrante", "https://github.com/owner/cuadrante.git", "develop").selected!!
         assertEquals("Nimroel RPG", first.displayName)
+        assertEquals(WorkspaceLocation.SHARED_DOCUMENTS, first.workspaceLocation)
         assertEquals(second.id, registry().load().selectedRepositoryId)
         store.select(first.id)
         assertEquals(first.id, registry().load().selectedRepositoryId)
@@ -78,7 +83,7 @@ class RepositoryRegistryTest {
         val main = store.add("A", "https://github.com/owner/repo", "main").selected!!
         val develop = store.add("B", "https://github.com/owner/repo.git", "develop").selected!!
         assertNotEquals(main.localDirectoryName, develop.localDirectoryName)
-        assertNotEquals(store.directoryFor(main), store.directoryFor(develop))
+        assertNotEquals(resolver().resolve(main), resolver().resolve(develop))
     }
 
     @Test fun invalidNamesUrlsAndBranchesAreRejected() {
@@ -95,10 +100,10 @@ class RepositoryRegistryTest {
     @Test fun generatedDirectoryCannotEscapeRepositoryRoot() {
         val store = emptyRegistry()
         val config = store.add("../../not-a-path", "https://github.com/o/r", "main").selected!!
-        assertTrue(config.localDirectoryName.matches(Regex("repo-[a-f0-9]{32}")))
-        assertEquals(File(folder.root, "repos").canonicalFile, store.directoryFor(config).parentFile)
+        assertTrue(config.localDirectoryName.matches(Regex("not-a-path-[a-f0-9]{12}")))
+        assertEquals(File(folder.root, "Documents/RobGit").canonicalFile, resolver().resolve(config).parentFile)
         assertThrows(IllegalArgumentException::class.java) {
-            store.directoryFor(config.copy(localDirectoryName = "../outside"))
+            resolver().resolve(config.copy(localDirectoryName = "../outside"))
         }
     }
 
@@ -106,7 +111,7 @@ class RepositoryRegistryTest {
         val store = emptyRegistry()
         val first = store.add("A", "https://github.com/o/a", "main").selected!!
         val second = store.add("B", "https://github.com/o/b", "main").selected!!
-        val directory = store.directoryFor(second).apply { mkdirs() }
+        val directory = resolver().resolve(second).apply { mkdirs() }
         val marker = File(directory, "keep.txt").apply { writeText("safe") }
         val after = store.remove(second.id)
         assertEquals(first.id, after.selectedRepositoryId)
