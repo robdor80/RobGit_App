@@ -456,6 +456,25 @@ private fun RobGitScreen(
             } finally { runningOperation = null }
         }
     }
+    fun requestPushCommitMessage() {
+        if (runningOperation != null) return
+        runningOperation = "comprobando conexión con GitHub"
+        clearNotice()
+        scope.launch {
+            try {
+                val authenticated = withContext(Dispatchers.IO) { hasPushAuthentication(authService) }
+                if (!authenticated) {
+                    commitPurpose = null
+                    setNotice(gitAuthMessage(), "No se realizó ningún push; tu trabajo local sigue intacto.")
+                } else {
+                    commitPurpose = CommitPurpose.PUSH
+                }
+            } catch (failure: Exception) {
+                commitPurpose = null
+                setNotice(gitAuthMessage(), "No se realizó ningún push; tu trabajo local sigue intacto.")
+            } finally { runningOperation = null }
+        }
+    }
     fun synchronize(commitMessage: String = "Cambios desde RobGit") {
         val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
@@ -550,7 +569,7 @@ private fun RobGitScreen(
                                 HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
                             }
                             ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
-                                { commitPurpose = CommitPurpose.PUSH },
+                                ::requestPushCommitMessage,
                                 { if (baseStatus.recommendedAction == RepositoryAction.PUSH) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
                                 { showAi = true }, Modifier.weight(.85f))
                         }
@@ -559,7 +578,7 @@ private fun RobGitScreen(
                         HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
                         Spacer(Modifier.height(if (tablet) 28.dp else 22.dp))
                         ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
-                            { commitPurpose = CommitPurpose.PUSH },
+                            ::requestPushCommitMessage,
                             { if (baseStatus.recommendedAction == RepositoryAction.PUSH) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
                             { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp))
                     }
