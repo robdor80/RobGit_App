@@ -1,0 +1,14 @@
+[
+  {
+    "relation": [
+      "delegate_permission/common.handle_all_urls"
+    ],
+    "target": {
+      "namespace": "android_app",
+      "package_name": "es.robertodorado.robgit",
+      "sha256_cert_fingerprints": [
+        "A4:43:1A:19:49:D2:8D:5E:9E:7C:E5:BD:06:06:48:E9:ED:94:B3:AE:45:6C:1A:31:90:AF:12:04:49:3E:B7:F2"
+      ]
+    }
+  }
+]
