@@ -25,7 +25,8 @@ data class MigrationRecord(
     val sourceFingerprint: String? = null,
 )
 
-class MigrationAuthenticationRequiredException : IllegalStateException("Se necesita el token de GitHub para completar el análisis del workspace migrado.")
+class MigrationAuthenticationRequiredException(val rejected: Boolean = false) :
+    IllegalStateException("Conecta RobGit con GitHub desde Ajustes para completar la migración.")
 
 /** Copies an app-private repository without ever changing or deleting the source. */
 class RepositoryMigrationManager(
@@ -180,7 +181,7 @@ class RepositoryMigrationManager(
         scan(final)
         val state = RepositoryStateService(repositoryUrl = config.remoteUrl, branch = config.branch, remoteGateway = remoteGateway)
             .refreshState(final, token)
-        if (state.authenticationRequired) throw MigrationAuthenticationRequiredException()
+        if (state.authenticationRequired) throw MigrationAuthenticationRequiredException(state.authenticationRejected)
         check(state.type != RepositoryStateType.ERROR) { "El workspace compartido está activo, pero el análisis no terminó: ${state.message}" }
         onAnalyzed(state)
         return record.copy(phase = MigrationPhase.COMPLETED).also { write(it); progress(it.phase) }

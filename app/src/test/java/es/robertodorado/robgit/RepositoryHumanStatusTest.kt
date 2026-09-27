@@ -80,8 +80,8 @@ class RepositoryHumanStatusTest {
     }
 
     @Test fun authenticationMessagesAreExplicit() {
-        assertTrue(RepositoryStatusPresenter.authRequired().title.contains("autorizar"))
-        assertTrue(RepositoryStatusPresenter.authFailed().title.contains("rechazó"))
+        assertTrue(RepositoryStatusPresenter.authRequired().explanation.contains("Ajustes"))
+        assertTrue(RepositoryStatusPresenter.authFailed().title.contains("volver a conectar"))
         assertTrue(RepositoryStatusPresenter.pushUncertain().title.contains("confirmar"))
     }
 

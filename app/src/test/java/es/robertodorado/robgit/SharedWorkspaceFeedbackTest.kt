@@ -42,11 +42,11 @@ class SharedWorkspaceFeedbackTest {
 
     @Test fun authorizationRequestIsPresentedClearly() {
         val result = sharedWorkspaceFeedback(
-            SharedWorkspaceResult("PUSH DE PRUEBA", false, "Introduce tu token de GitHub.", "/test",
+            SharedWorkspaceResult("PUSH DE PRUEBA", false, "Conecta RobGit con GitHub desde Ajustes.", "/test",
                 authenticationRequired = true),
         )
         assertEquals("Hace falta autorización de GitHub", result.title)
-        assertEquals("Introduce tu token de GitHub.", result.detail)
+        assertEquals("Conecta RobGit con GitHub desde Ajustes.", result.detail)
     }
 
     private fun feedback(

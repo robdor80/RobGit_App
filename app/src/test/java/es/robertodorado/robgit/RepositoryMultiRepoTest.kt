@@ -117,6 +117,38 @@ class RepositoryMultiRepoTest {
         assertEquals(SynchronizationOutcome.AUTH_REQUIRED, sync.outcome)
     }
 
+    @Test fun fetchFailureNeverReturnsCredentialText() {
+        val repo = fixture("redacted-fetch", "main")
+        val secret = "oauth-sensitive-test-value"
+        val gateway = object : RepositoryRemoteGateway {
+            override fun fetch(git: Git, credentials: CredentialsProvider?) {
+                throw IllegalStateException("401 $secret")
+            }
+            override fun pushMain(git: Git, credentials: CredentialsProvider): PushTransportResult =
+                error("Unexpected push")
+        }
+        val token = secret.toCharArray()
+        val state = RepositoryStateService(repo.remote.toURI().toString(), gateway).refreshState(repo.local, token)
+        assertTrue(state.authenticationRejected)
+        assertFalse(state.toString().contains(secret))
+        assertTrue(token.all { it == '\u0000' })
+    }
+
+    @Test fun repositoryNotFoundDoesNotMarkOAuthTokenAsInvalid() {
+        val repo = fixture("repository-not-found", "main")
+        val gateway = object : RepositoryRemoteGateway {
+            override fun fetch(git: Git, credentials: CredentialsProvider?) {
+                throw IllegalStateException("404 repository not found")
+            }
+            override fun pushMain(git: Git, credentials: CredentialsProvider): PushTransportResult =
+                error("Unexpected push")
+        }
+        val state = RepositoryStateService(repo.remote.toURI().toString(), gateway)
+            .refreshState(repo.local, "oauth-test-value".toCharArray())
+        assertTrue(state.authenticationRequired)
+        assertFalse(state.authenticationRejected)
+    }
+
     @Test fun authorizationOnSecondSynchronizationFetchIsPreserved() {
         val repo = fixture("second-fetch", "main")
         commitAndPush(repo, "remote.txt", "ahead")

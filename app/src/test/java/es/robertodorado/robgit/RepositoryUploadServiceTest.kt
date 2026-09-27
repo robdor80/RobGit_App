@@ -320,6 +320,19 @@ class RepositoryUploadServiceTest {
     }
 
     @Test
+    fun rejectedPushDetailCannotExposeOAuthToken() {
+        val fixture = fixture()
+        val secret = "oauth-sensitive-test-value"
+        File(fixture.local, "local.txt").writeText("trabajo local")
+        fixture.gateway.pushBehavior = { _, _ -> PushTransportResult(PushTransportOutcome.ERROR, secret) }
+        val result = fixture.service.uploadSafely(fixture.local, secret.toCharArray(), "commit protegido")
+        assertEquals(UploadOutcome.ERROR, result.outcome)
+        assertTrue(result.commitCreated)
+        assertFalse(result.toString().contains(secret))
+        assertEquals(null, readBareFile(fixture.remote, "local.txt"))
+    }
+
+    @Test
     fun initialFetchFailureDoesNotStageCommitOrPush() {
         val fixture = fixture()
         fixture.gateway.failFetchOn = 1

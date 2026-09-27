@@ -13,7 +13,6 @@ import java.util.UUID
 
 private const val REMOTE_TEST_URL = "https://github.com/robdor80/RobGit_App.git"
 private const val PUSH_TEST_URL = "https://github.com/robdor80/Robgit.pruebas.git"
-private const val PUSH_TEST_USERNAME = "robdor80"
 private const val PUSH_TEST_FILE = "robgit_android_test.txt"
 private const val PUSH_TEST_MESSAGE = "Prueba de push desde RobGit Android"
 
@@ -26,6 +25,7 @@ data class DiagnosticResult(
     val status: String,
     val steps: List<DiagnosticStep>,
     val error: String? = null,
+    val authenticationRejected: Boolean = false,
 )
 
 /** Only local Git operations needed to test JGit inside Android. */
@@ -241,10 +241,10 @@ class GitRepositoryService {
         var pushResponseReceived = false
         var pushAcceptedByResponse = false
         var remoteConfirmed = false
-        val credentials = UsernamePasswordCredentialsProvider(PUSH_TEST_USERNAME, token)
+        val credentials = githubJGitCredentials(token)
 
         try {
-            require(token.isNotEmpty()) { "Introduce un token antes de ejecutar la prueba" }
+            require(token.isNotEmpty()) { "Conecta RobGit con GitHub desde Ajustes antes de ejecutar la prueba" }
             require(!repositoryDirectory.exists()) {
                 "La carpeta de diagnóstico ya existe: ${repositoryDirectory.absolutePath}"
             }
@@ -383,6 +383,11 @@ class GitRepositoryService {
             if (failure !is Exception && failure !is LinkageError) throw failure
             val safeError = authenticatedError(stage, failure, token)
             if (safeError == "GitHub rechazó las credenciales.") {
+                val explicitRejection = generateSequence(failure) { it.cause }.take(5).any {
+                    val detail = it.message.orEmpty().lowercase()
+                    "401" in detail || "bad credentials" in detail || "invalid credentials" in detail ||
+                        "not authorized" in detail || "unauthorized" in detail
+                }
                 return DiagnosticResult(
                     repositoryPath = repositoryDirectory.absolutePath,
                     branch = branch,
@@ -390,6 +395,7 @@ class GitRepositoryService {
                     status = status,
                     steps = steps,
                     error = safeError,
+                    authenticationRejected = explicitRejection,
                 )
             }
             if (pushStarted && !pushResponseReceived && localCommit != null) {

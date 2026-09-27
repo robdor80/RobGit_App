@@ -29,6 +29,8 @@ object RepositoryStatusPresenter {
     )
 
     fun present(state: RepositoryStateSnapshot): RepositoryHumanStatus {
+        if (state.repositoryAccessDenied) return repositoryAccessDenied()
+        if (state.authenticationRejected) return authFailed()
         if (state.authenticationRequired) return authorizationForReading()
         if (state.type == RepositoryStateType.ERROR &&
             (state.error.orEmpty().contains("no existe después del fetch", ignoreCase = true) ||
@@ -115,20 +117,26 @@ object RepositoryStatusPresenter {
     }
 
     fun authRequired() = RepositoryHumanStatus(
-        "Para subir cambios necesitas autorizar RobGit en GitHub.",
-        "Introduce tu token de GitHub para continuar.",
+        "Para subir cambios necesitas conectar RobGit con GitHub.",
+        "Conecta RobGit con GitHub desde Ajustes para continuar.",
         recommendedAction = RepositoryAction.PUSH,
     )
 
     fun authorizationForReading() = RepositoryHumanStatus(
-        "Para comprobar este repositorio necesitas autorizar RobGit en GitHub.",
-        "Introduce tu token de GitHub para continuar.",
+        "Para comprobar este repositorio necesitas conectar RobGit con GitHub.",
+        "Conecta RobGit con GitHub desde Ajustes para continuar.",
         blocked = true,
     )
 
     fun authFailed() = RepositoryHumanStatus(
-        "GitHub rechazó las credenciales.",
-        "El token no es válido, ha caducado o no tiene los permisos necesarios.",
+        "Es necesario volver a conectar GitHub.",
+        "Abre Ajustes y conecta RobGit con GitHub de nuevo.",
+        blocked = true,
+    )
+
+    fun repositoryAccessDenied() = RepositoryHumanStatus(
+        "RobGit no tiene acceso a este repositorio desde GitHub.",
+        "Comprueba que la instalación de RobGit RD autoriza este repositorio.",
         blocked = true,
     )
 
@@ -169,7 +177,9 @@ object RepositoryStatusPresenter {
             "RobGit no realizará ninguna operación automática para evitar perder trabajo.",
             blocked = true,
         )
-        DownloadOutcome.FETCH_ERROR -> if (result.finalState?.authenticationRequired == true)
+        DownloadOutcome.FETCH_ERROR -> if (result.finalState?.repositoryAccessDenied == true)
+            repositoryAccessDenied() else if (result.finalState?.authenticationRejected == true)
+            authFailed() else if (result.finalState?.authenticationRequired == true)
             authorizationForReading() else fetchError()
         DownloadOutcome.ERROR -> genericError()
     }
@@ -182,7 +192,7 @@ object RepositoryStatusPresenter {
             "Todo está al día.", "No había cambios pendientes de subir.",
         )
         UploadOutcome.AUTH_REQUIRED -> authRequired()
-        UploadOutcome.AUTH_FAILED -> authFailed()
+        UploadOutcome.AUTH_FAILED -> if (result.authenticationRejected) authFailed() else repositoryAccessDenied()
         UploadOutcome.PUSH_UNCERTAIN -> pushUncertain()
         UploadOutcome.BLOCKED_CONFLICTS -> conflicts()
         UploadOutcome.BLOCKED_DIVERGED -> diverged()
@@ -207,9 +217,12 @@ object RepositoryStatusPresenter {
         SynchronizationOutcome.NOTHING_TO_DO -> RepositoryHumanStatus(
             "Todo está al día.", "No era necesario hacer nada.",
         )
-        SynchronizationOutcome.AUTH_REQUIRED -> if (result.finalState?.authenticationRequired == true)
+        SynchronizationOutcome.AUTH_REQUIRED -> if (result.finalState?.repositoryAccessDenied == true)
+            repositoryAccessDenied() else if (result.finalState?.authenticationRejected == true)
+            authFailed() else if (result.finalState?.authenticationRequired == true)
             authorizationForReading() else authRequired()
-        SynchronizationOutcome.AUTH_FAILED -> authFailed()
+        SynchronizationOutcome.AUTH_FAILED -> if (result.uploadResult?.authenticationRejected == true)
+            authFailed() else repositoryAccessDenied()
         SynchronizationOutcome.PUSH_UNCERTAIN -> pushUncertain()
         SynchronizationOutcome.BLOCKED_CONFLICTS -> conflicts()
         SynchronizationOutcome.BLOCKED_DIVERGED -> diverged()

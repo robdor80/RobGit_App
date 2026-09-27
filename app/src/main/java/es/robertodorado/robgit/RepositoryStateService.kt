@@ -60,6 +60,8 @@ data class RepositoryStateSnapshot(
     val remoteStateIsFresh: Boolean,
     val error: String? = null,
     val authenticationRequired: Boolean = false,
+    val authenticationRejected: Boolean = false,
+    val repositoryAccessDenied: Boolean = false,
 )
 
 data class RepositoryPreparationResult(
@@ -69,6 +71,7 @@ data class RepositoryPreparationResult(
     val message: String,
     val error: String? = null,
     val authenticationRequired: Boolean = false,
+    val authenticationRejected: Boolean = false,
 )
 
 enum class DownloadOutcome {
@@ -115,6 +118,7 @@ data class UploadResult(
     val commitsUploaded: Int,
     val finalState: RepositoryStateSnapshot?,
     val error: String? = null,
+    val authenticationRejected: Boolean = false,
 )
 
 enum class SynchronizationOutcome {
@@ -141,12 +145,21 @@ data class SynchronizationResult(
     val error: String? = null,
 )
 
+/** Small seam for testing credential delivery without invoking a remote repository. */
+interface RepositoryGitEngine {
+    fun prepare(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryPreparationResult
+    fun refreshState(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryStateSnapshot
+    fun downloadFastForward(repositoryDirectory: File, token: CharArray = charArrayOf()): DownloadResult
+    fun uploadSafely(repositoryDirectory: File, token: CharArray, commitMessage: String): UploadResult
+    fun synchronizeSafely(repositoryDirectory: File, token: CharArray, commitMessage: String): SynchronizationResult
+}
+
 /** Safe Git operations scoped to one configured remote and branch. */
 class RepositoryStateService(
     private val repositoryUrl: String,
     private val remoteGateway: RepositoryRemoteGateway = JGitRepositoryRemoteGateway(),
     private val branch: String = "main",
-) {
+) : RepositoryGitEngine {
     private val remoteTrackingRef: String get() = "refs/remotes/origin/$branch"
 
     fun isPrepared(repositoryDirectory: File): Boolean = try {
@@ -159,7 +172,7 @@ class RepositoryStateService(
         false
     }
 
-    fun prepare(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryPreparationResult {
+    override fun prepare(repositoryDirectory: File, token: CharArray): RepositoryPreparationResult {
         var temporaryDirectory: File? = null
         try {
             if (repositoryDirectory.exists()) {
@@ -189,7 +202,7 @@ class RepositoryStateService(
             repositoryDirectory.parentFile?.mkdirs()
             val stagingDirectory = File(repositoryDirectory.parentFile, ".${repositoryDirectory.name}.preparing-${java.util.UUID.randomUUID()}")
             temporaryDirectory = stagingDirectory
-            val credentials = if (token.isNotEmpty()) UsernamePasswordCredentialsProvider("x-access-token", token) else null
+            val credentials = if (token.isNotEmpty()) githubJGitCredentials(token) else null
             try {
                 Git.cloneRepository()
                     .setURI(repositoryUrl)
@@ -236,13 +249,15 @@ class RepositoryStateService(
                 repositoryPath = repositoryDirectory.absolutePath,
                 cloned = false,
                 message = when {
-                    authFailure && token.isEmpty() -> "Este repositorio necesita autorización de GitHub."
-                    authFailure -> "GitHub rechazó las credenciales."
+                    authFailure && token.isEmpty() -> "Conecta RobGit con GitHub desde Ajustes para acceder a este repositorio."
+                    authFailure && isExplicitAuthenticationRejection(failure) -> "Es necesario volver a conectar GitHub."
+                    authFailure -> "RobGit no tiene acceso a este repositorio desde GitHub."
                     missingBranch -> "La rama configurada $branch no existe en este repositorio."
                     else -> "No se pudo preparar el repositorio."
                 },
                 error = safeFailure("Preparación del repositorio", failure),
                 authenticationRequired = authFailure,
+                authenticationRejected = token.isNotEmpty() && isExplicitAuthenticationRejection(failure),
             )
         } finally {
             temporaryDirectory?.let { temp ->
@@ -256,9 +271,9 @@ class RepositoryStateService(
     }
 
     /** Fetches origin and then calculates state without changing HEAD or working-tree files. */
-    fun refreshState(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryStateSnapshot {
+    override fun refreshState(repositoryDirectory: File, token: CharArray): RepositoryStateSnapshot {
         val checkedAt = Instant.now()
-        val credentials = if (token.isNotEmpty()) UsernamePasswordCredentialsProvider("x-access-token", token) else null
+        val credentials = if (token.isNotEmpty()) githubJGitCredentials(token) else null
         try {
             check(File(repositoryDirectory, ".git").isDirectory) {
                 "El repositorio persistente todavía no está preparado."
@@ -275,6 +290,7 @@ class RepositoryStateService(
                         "No se pudo actualizar el estado desde GitHub. El estado remoto no está verificado.",
                         failure,
                         authenticationRequired = isAuthenticationFailure(failure),
+                        authenticationRejected = token.isNotEmpty() && isExplicitAuthenticationRejection(failure),
                     )
                 }
                 return inspectFetchedState(git, checkedAt)
@@ -293,9 +309,9 @@ class RepositoryStateService(
     }
 
     /** Revalidates with fetch and applies only a verified fast-forward of main. */
-    fun downloadFastForward(repositoryDirectory: File, token: CharArray = charArrayOf()): DownloadResult {
+    override fun downloadFastForward(repositoryDirectory: File, token: CharArray): DownloadResult {
         val checkedAt = Instant.now()
-        val credentials = if (token.isNotEmpty()) UsernamePasswordCredentialsProvider("x-access-token", token) else null
+        val credentials = if (token.isNotEmpty()) githubJGitCredentials(token) else null
         try {
             check(File(repositoryDirectory, ".git").isDirectory) {
                 "El repositorio persistente todavía no está preparado."
@@ -311,6 +327,7 @@ class RepositoryStateService(
                         "No se pudo actualizar el estado desde GitHub. El estado remoto no está verificado.",
                         failure,
                         authenticationRequired = isAuthenticationFailure(failure),
+                        authenticationRejected = token.isNotEmpty() && isExplicitAuthenticationRejection(failure),
                     )
                     return downloadError(
                         "No se ha podido comprobar GitHub con seguridad. No se realizó ningún cambio.",
@@ -410,7 +427,7 @@ class RepositoryStateService(
     }
 
     /** Revalidates origin, commits pending files once, and performs one normal non-forced push. */
-    fun uploadSafely(
+    override fun uploadSafely(
         repositoryDirectory: File,
         token: CharArray,
         commitMessage: String,
@@ -440,7 +457,7 @@ class RepositoryStateService(
                 if (token.isEmpty()) {
                     return uploadResult(
                         outcome = UploadOutcome.AUTH_REQUIRED,
-                        message = "Introduce un token de GitHub para subir.",
+                        message = "Conecta RobGit con GitHub desde Ajustes para subir.",
                         git = git,
                     )
                 }
@@ -453,7 +470,7 @@ class RepositoryStateService(
                     )
                 }
 
-                credentials = UsernamePasswordCredentialsProvider("x-access-token", token)
+                credentials = githubJGitCredentials(token)
                 try {
                     remoteGateway.fetch(git, credentials)
                 } catch (failure: Throwable) {
@@ -463,6 +480,7 @@ class RepositoryStateService(
                             outcome = UploadOutcome.AUTH_FAILED,
                             message = "GitHub rechazó las credenciales. No se modificó el trabajo local.",
                             git = git,
+                            authenticationRejected = isExplicitAuthenticationRejection(failure),
                         )
                     } else {
                         uploadResult(
@@ -572,6 +590,7 @@ class RepositoryStateService(
                         } else {
                             null
                         },
+                        authenticationRejected = outcome == UploadOutcome.AUTH_FAILED && isExplicitAuthenticationRejection(failure),
                     )
                 }
 
@@ -619,6 +638,7 @@ class RepositoryStateService(
                             previousHead = previousHead,
                             attemptedHead = attemptedHead,
                             commitCreated = commitCreated,
+                            authenticationRejected = isExplicitAuthenticationRejection(failure),
                         )
                     }
                     return verifyAmbiguousPushOnce(
@@ -662,6 +682,7 @@ class RepositoryStateService(
                         previousHead = previousHead,
                         attemptedHead = attemptedHead,
                         commitCreated = commitCreated,
+                        authenticationRejected = true,
                     )
                     PushTransportOutcome.AMBIGUOUS -> verifyAmbiguousPushOnce(
                         git = git,
@@ -681,7 +702,7 @@ class RepositoryStateService(
                         previousHead = previousHead,
                         attemptedHead = attemptedHead,
                         commitCreated = commitCreated,
-                        error = pushResult.detail,
+                        error = "Resultado remoto no aceptado.",
                     )
                 }
             }
@@ -707,7 +728,7 @@ class RepositoryStateService(
     }
 
     /** Chooses at most one already-validated operation: no action, fast-forward download, or upload. */
-    fun synchronizeSafely(
+    override fun synchronizeSafely(
         repositoryDirectory: File,
         token: CharArray,
         commitMessage: String,
@@ -1007,6 +1028,7 @@ class RepositoryStateService(
         commitsUploaded: Int = 0,
         finalState: RepositoryStateSnapshot? = null,
         error: String? = null,
+        authenticationRejected: Boolean = false,
     ) = UploadResult(
         outcome = outcome,
         message = message,
@@ -1016,6 +1038,7 @@ class RepositoryStateService(
         commitsUploaded = commitsUploaded,
         finalState = finalState,
         error = error,
+        authenticationRejected = authenticationRejected,
     )
 
     private fun savedWorkMessage(message: String, commitCreated: Boolean): String =
@@ -1031,6 +1054,13 @@ class RepositoryStateService(
             "not authorized" in text || "authentication" in text ||
                 "unauthorized" in text || "401" in text || "403" in text ||
                 "repository not found" in text || "404" in text
+        }
+
+    private fun isExplicitAuthenticationRejection(failure: Throwable): Boolean =
+        generateSequence(failure) { it.cause }.take(5).any {
+            val text = "${it.javaClass.name} ${it.message.orEmpty()}".lowercase()
+            "401" in text || "bad credentials" in text || "invalid credentials" in text ||
+                "not authorized" in text || "unauthorized" in text
         }
 
     /** Returns diagnostic classes only; exception messages can contain credential material. */
@@ -1211,6 +1241,7 @@ class RepositoryStateService(
         message: String,
         failure: Throwable,
         authenticationRequired: Boolean = false,
+        authenticationRejected: Boolean = false,
     ) = RepositoryStateSnapshot(
         type = RepositoryStateType.ERROR,
         relation = CommitRelation.UNDETERMINED,
@@ -1225,6 +1256,7 @@ class RepositoryStateService(
         remoteStateIsFresh = false,
         error = causeChain(failure),
         authenticationRequired = authenticationRequired,
+        authenticationRejected = authenticationRejected,
     )
 
     private data class CommitCounts(
@@ -1236,4 +1268,4 @@ class RepositoryStateService(
 
 private fun causeChain(failure: Throwable): String = generateSequence(failure) { it.cause }
     .take(5)
-    .joinToString(" ← ") { "${it.javaClass.simpleName}: ${it.message ?: "sin detalle"}" }
+    .joinToString(" ← ") { it.javaClass.simpleName }

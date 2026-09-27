@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -45,8 +44,6 @@ import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -104,7 +101,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class AuthPurpose { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, MIGRATION, WORKSPACE_PREPARE, WORKSPACE_ANALYZE, WORKSPACE_PULL, WORKSPACE_PUSH, WORKSPACE_SYNCHRONIZE, DIAGNOSTIC }
+private enum class CommitPurpose { PUSH, SYNCHRONIZE, WORKSPACE_PUSH, WORKSPACE_SYNCHRONIZE }
 private enum class SharedWorkspaceAction { PREPARE, ANALYZE, PULL, PUSH, SYNCHRONIZE, FILESYSTEM }
 
 @Composable
@@ -135,7 +132,7 @@ private fun RobGitScreen(
     var showTechnical by remember { mutableStateOf(false) }
     var showSettings by remember { mutableStateOf(false) }
     var showAi by remember { mutableStateOf(false) }
-    var authPurpose by remember { mutableStateOf<AuthPurpose?>(null) }
+    var commitPurpose by remember { mutableStateOf<CommitPurpose?>(null) }
     var localDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
     var remoteDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
     var pushDiagnostic by remember { mutableStateOf<DiagnosticResult?>(null) }
@@ -153,7 +150,6 @@ private fun RobGitScreen(
     var migrationDialogVisible by remember { mutableStateOf(false) }
     var migrationDialogError by remember { mutableStateOf<String?>(null) }
     var migrationPhase by remember { mutableStateOf<MigrationPhase?>(null) }
-    var migrationTargetId by remember { mutableStateOf<String?>(null) }
     val selectedPendingMigration = pendingMigrations?.firstOrNull { it.repositoryId == selectedRepository?.id }
     val sharedAccessMissing = selectedRepository?.workspaceLocation == WorkspaceLocation.SHARED_DOCUMENTS &&
         !Environment.isExternalStorageManager()
@@ -175,6 +171,7 @@ private fun RobGitScreen(
     }
     val scope = rememberCoroutineScope()
     val githubState by authService.state.collectAsState()
+    val gitOperations = remember(authService) { GitHubGitOperations(authService) }
 
     LaunchedEffect(authService) {
         withContext(Dispatchers.IO) { authService.restore() }
@@ -222,12 +219,8 @@ private fun RobGitScreen(
         workspacePermissionLauncher.launch(intent)
     }
 
-    fun runSharedWorkspace(action: SharedWorkspaceAction, token: CharArray = charArrayOf(), message: String = "Prueba workspace compartido") {
-        if (runningOperation != null) {
-            token.fill('\u0000')
-            return
-        }
-        val suppliedToken = token.isNotEmpty()
+    fun runSharedWorkspace(action: SharedWorkspaceAction, message: String = "Prueba workspace compartido") {
+        if (runningOperation != null) return
         val operationLabel = when (action) {
             SharedWorkspaceAction.PREPARE -> "PREPARAR WORKSPACE"
             SharedWorkspaceAction.ANALYZE -> "ANALIZAR WORKSPACE"
@@ -243,39 +236,31 @@ private fun RobGitScreen(
             try {
                 val result = withContext(Dispatchers.IO) {
                     when (action) {
-                        SharedWorkspaceAction.PREPARE -> sharedWorkspaceProbe.prepare(token)
-                        SharedWorkspaceAction.ANALYZE -> sharedWorkspaceProbe.analyze(token)
-                        SharedWorkspaceAction.PULL -> sharedWorkspaceProbe.pull(token)
-                        SharedWorkspaceAction.PUSH -> sharedWorkspaceProbe.push(token, message)
-                        SharedWorkspaceAction.SYNCHRONIZE -> sharedWorkspaceProbe.synchronize(token, message)
+                        SharedWorkspaceAction.PREPARE -> gitOperations.sharedPrepare(sharedWorkspaceProbe)
+                        SharedWorkspaceAction.ANALYZE -> gitOperations.sharedAnalyze(sharedWorkspaceProbe)
+                        SharedWorkspaceAction.PULL -> gitOperations.sharedPull(sharedWorkspaceProbe)
+                        SharedWorkspaceAction.PUSH -> gitOperations.sharedPush(sharedWorkspaceProbe, message)
+                        SharedWorkspaceAction.SYNCHRONIZE -> gitOperations.sharedSynchronize(sharedWorkspaceProbe, message)
                         SharedWorkspaceAction.FILESYSTEM -> sharedWorkspaceProbe.probeFilesystem()
                     }
                 }
                 sharedWorkspaceResult = result
-                if (result.authenticationRequired && !suppliedToken) {
-                    authPurpose = when (action) {
-                        SharedWorkspaceAction.PREPARE -> AuthPurpose.WORKSPACE_PREPARE
-                        SharedWorkspaceAction.ANALYZE -> AuthPurpose.WORKSPACE_ANALYZE
-                        SharedWorkspaceAction.PULL -> AuthPurpose.WORKSPACE_PULL
-                        SharedWorkspaceAction.PUSH -> AuthPurpose.WORKSPACE_PUSH
-                        SharedWorkspaceAction.SYNCHRONIZE -> AuthPurpose.WORKSPACE_SYNCHRONIZE
-                        SharedWorkspaceAction.FILESYSTEM -> null
-                    }
-                } else if (result.authenticationRequired) {
-                    RepositoryStatusPresenter.authFailed().let {
-                        sharedWorkspaceResult = result.copy(message = "${it.title} ${it.explanation}")
-                    }
-                }
+                if (result.authenticationRequired) sharedWorkspaceResult = result.copy(message = when (authService.state.value) {
+                    GitHubConnectionState.NeedsReauth -> "Es necesario volver a conectar GitHub desde Ajustes."
+                    GitHubConnectionState.NotConfigured -> "La conexión con GitHub no está configurada localmente."
+                    is GitHubConnectionState.Connected -> "RobGit no tiene acceso a este repositorio desde GitHub."
+                    else -> "Conecta RobGit con GitHub desde Ajustes para continuar."
+                })
             } catch (failure: Exception) {
                 if (failure is kotlinx.coroutines.CancellationException) throw failure
                 sharedWorkspaceResult = SharedWorkspaceResult(
                     operation = operationLabel,
                     success = false,
-                    message = "No se pudo completar la operación (${failure.javaClass.simpleName}).",
+                    message = if (failure is GitAccessUnavailableException) failure.message.orEmpty()
+                        else "No se pudo completar la operación (${failure.javaClass.simpleName}).",
                     repositoryPath = sharedWorkspaceProbe.repositoryDirectory.absolutePath,
                 )
             } finally {
-                token.fill('\u0000')
                 activeWorkspaceOperation = null
                 runningOperation = null
             }
@@ -304,6 +289,12 @@ private fun RobGitScreen(
     fun setNotice(title: String, body: String, recommendation: String? = null) {
         noticeTitle = title; noticeBody = body; noticeRecommendation = recommendation
     }
+    fun gitAuthMessage(): String = when (authService.state.value) {
+        GitHubConnectionState.NeedsReauth -> "Es necesario volver a conectar GitHub desde Ajustes."
+        GitHubConnectionState.NotConfigured -> "La conexión con GitHub no está configurada localmente."
+        is GitHubConnectionState.Connected -> "RobGit no tiene acceso a este repositorio desde GitHub."
+        else -> "Conecta RobGit con GitHub desde Ajustes para continuar."
+    }
     fun operationDirectory(): File? {
         val config = selectedRepository ?: return null
         if (pendingMigrations == null || selectedPendingMigration != null || migrationJournalError != null) return null
@@ -318,16 +309,14 @@ private fun RobGitScreen(
         lastOperation = null
         clearNotice()
     }
-    fun runMigration(config: RepositoryConfig, token: CharArray = charArrayOf()) {
-        if (runningOperation != null || migrationJournalError != null) { token.fill('\u0000'); return }
+    fun runMigration(config: RepositoryConfig) {
+        if (runningOperation != null || migrationJournalError != null) return
         if (!hasAllFilesAccess) {
-            token.fill('\u0000')
             migrationPhase = null
             migrationDialogError = "RobGit necesita acceso al workspace compartido para migrar este repositorio."
             migrationDialogVisible = true
             return
         }
-        migrationTargetId = config.id
         migrationDialogVisible = true
         migrationDialogError = null
         migrationPhase = MigrationPhase.PLANNED
@@ -336,7 +325,7 @@ private fun RobGitScreen(
             try {
                 val completed = withContext(Dispatchers.IO) {
                     var analyzed: RepositoryStateSnapshot? = null
-                    migrationManager.migrate(config.id, token, onAnalyzed = { analyzed = it }) { phase ->
+                    gitOperations.migrate(migrationManager, config.id, onAnalyzed = { analyzed = it }) { phase ->
                         scope.launch { if (migrationPhase != MigrationPhase.COMPLETED) migrationPhase = phase }
                     }
                     Triple(analyzed, registry.load(), migrationManager.pending())
@@ -352,11 +341,11 @@ private fun RobGitScreen(
                 if (failure is kotlinx.coroutines.CancellationException) throw failure
                 hasAllFilesAccess = Environment.isExternalStorageManager()
                 migrationDialogError = failure.message ?: "La migración se detuvo. La copia privada permanece intacta."
-                if (failure is MigrationAuthenticationRequiredException) authPurpose = AuthPurpose.MIGRATION
+                if (failure is MigrationAuthenticationRequiredException || failure is GitAccessUnavailableException)
+                    migrationDialogError = gitAuthMessage()
                 runCatching { withContext(Dispatchers.IO) { registry.load() } }.onSuccess { catalog = it }
                 runCatching { withContext(Dispatchers.IO) { migrationManager.pending() } }.onSuccess { pendingMigrations = it }
             } finally {
-                token.fill('\u0000')
                 runningOperation = null
             }
         }
@@ -395,99 +384,93 @@ private fun RobGitScreen(
             }
         }
     }
-    fun analyze(token: CharArray = charArrayOf()) {
-        val suppliedToken = token.isNotEmpty()
-        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
+    fun analyze() {
+        val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
         if (runningOperation != null || repositoryPrepared != true) return
         runningOperation = "analizando"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { service.refreshState(directory, token) }
+                val result = withContext(Dispatchers.IO) { gitOperations.analyze(service, directory) }
                 repositoryState = result
                 lastOperation = RestoredOperation("ANALIZAR AHORA", result.type.name, result.message, result.error)
-                if (result.authenticationRequired) {
-                    if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
-                    else authPurpose = AuthPurpose.ANALYZE
-                }
-            } finally { token.fill('\u0000'); runningOperation = null }
+                if (result.authenticationRequired) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
+            } catch (failure: GitAccessUnavailableException) {
+                setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
+            } finally { runningOperation = null }
         }
     }
-    fun prepareRepository(token: CharArray = charArrayOf()) {
-        val suppliedToken = token.isNotEmpty()
-        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
+    fun prepareRepository() {
+        val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
         if (runningOperation != null) return
         runningOperation = "preparando"; clearNotice()
         scope.launch {
-            val refreshToken = token.copyOf()
             try {
-                val result = withContext(Dispatchers.IO) { service.prepare(directory, token) }
+                val result = withContext(Dispatchers.IO) { gitOperations.prepare(service, directory) }
                 repositoryPrepared = result.success
                 lastOperation = RestoredOperation("PREPARAR REPOSITORIO", if (result.success) "OK" else "ERROR", result.message, result.error)
                 if (result.success) {
-                    repositoryState = withContext(Dispatchers.IO) { service.refreshState(directory, refreshToken) }
-                    if (repositoryState?.authenticationRequired == true) {
-                        if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
-                        else authPurpose = AuthPurpose.ANALYZE
-                    }
+                    repositoryState = withContext(Dispatchers.IO) { gitOperations.analyze(service, directory) }
+                    if (repositoryState?.authenticationRequired == true) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
                 }
                 else {
-                    setNotice(result.message, if (result.authenticationRequired) "Introduce tu token de GitHub para continuar." else "Tus archivos locales están protegidos.")
-                    if (result.authenticationRequired && !suppliedToken) authPurpose = AuthPurpose.PREPARE
+                    setNotice(if (result.authenticationRequired) gitAuthMessage() else result.message,
+                        "Tus archivos locales están protegidos.")
                 }
-            } finally { token.fill('\u0000'); refreshToken.fill('\u0000'); runningOperation = null }
+            } catch (failure: GitAccessUnavailableException) {
+                setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
+            } finally { runningOperation = null }
         }
     }
-    fun pull(token: CharArray = charArrayOf()) {
-        val suppliedToken = token.isNotEmpty()
-        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
+    fun pull() {
+        val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
         if (runningOperation != null) return
         runningOperation = "PULL"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { service.downloadFastForward(directory, token) }
+                val result = withContext(Dispatchers.IO) { gitOperations.pull(service, directory) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("PULL", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
-                if (result.finalState?.authenticationRequired == true) {
-                    if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
-                    else authPurpose = AuthPurpose.PULL
-                }
-            } finally { token.fill('\u0000'); runningOperation = null }
+                if (result.finalState?.authenticationRequired == true) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
+            } catch (failure: GitAccessUnavailableException) {
+                setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
+            } finally { runningOperation = null }
         }
     }
-    fun upload(token: CharArray, commitMessage: String) {
-        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
+    fun upload(commitMessage: String) {
+        val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
+        if (runningOperation != null) return
         runningOperation = "PUSH"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { service.uploadSafely(directory, token, commitMessage) }
+                val result = withContext(Dispatchers.IO) { gitOperations.push(service, directory, commitMessage) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("PUSH", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
-                if (result.outcome == UploadOutcome.AUTH_REQUIRED) authPurpose = AuthPurpose.PUSH
-            } finally { token.fill('\u0000'); runningOperation = null }
+            } catch (failure: GitAccessUnavailableException) {
+                setNotice(failure.message.orEmpty(), "No se realizó ningún push; tu trabajo local sigue intacto.")
+            } finally { runningOperation = null }
         }
     }
-    fun synchronize(token: CharArray = charArrayOf(), commitMessage: String = "Cambios desde RobGit") {
-        val suppliedToken = token.isNotEmpty()
-        val directory = operationDirectory() ?: run { token.fill('\u0000'); return }
+    fun synchronize(commitMessage: String = "Cambios desde RobGit") {
+        val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
+        if (runningOperation != null) return
         runningOperation = "SINCRONIZAR"; clearNotice()
         scope.launch {
             try {
-                val result = withContext(Dispatchers.IO) { service.synchronizeSafely(directory, token, commitMessage) }
+                val result = withContext(Dispatchers.IO) { gitOperations.synchronize(service, directory, commitMessage) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("SINCRONIZAR", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
-                if (result.outcome == SynchronizationOutcome.AUTH_REQUIRED) {
-                    if (suppliedToken) RepositoryStatusPresenter.authFailed().let { setNotice(it.title, it.explanation) }
-                    else authPurpose = AuthPurpose.SYNCHRONIZE
-                }
-            } finally { token.fill('\u0000'); runningOperation = null }
+                if (result.outcome == SynchronizationOutcome.AUTH_REQUIRED) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
+            } catch (failure: GitAccessUnavailableException) {
+                setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
+            } finally { runningOperation = null }
         }
     }
 
@@ -502,9 +485,11 @@ private fun RobGitScreen(
                 val prepared = withContext(Dispatchers.IO) { service.isPrepared(directory) }
                 repositoryPrepared = prepared
                 if (prepared) {
-                    repositoryState = withContext(Dispatchers.IO) { service.refreshState(directory) }
-                    if (repositoryState?.authenticationRequired == true) authPurpose = AuthPurpose.ANALYZE
+                    repositoryState = withContext(Dispatchers.IO) { gitOperations.analyze(service, directory) }
+                    if (repositoryState?.authenticationRequired == true) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
                 }
+            } catch (failure: GitAccessUnavailableException) {
+                setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
             } finally { runningOperation = null }
         }
     }
@@ -565,8 +550,8 @@ private fun RobGitScreen(
                                 HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
                             }
                             ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
-                                { authPurpose = AuthPurpose.PUSH },
-                                { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
+                                { commitPurpose = CommitPurpose.PUSH },
+                                { if (baseStatus.recommendedAction == RepositoryAction.PUSH) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
                                 { showAi = true }, Modifier.weight(.85f))
                         }
                     } else {
@@ -574,8 +559,8 @@ private fun RobGitScreen(
                         HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
                         Spacer(Modifier.height(if (tablet) 28.dp else 22.dp))
                         ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
-                            { authPurpose = AuthPurpose.PUSH },
-                            { if (baseStatus.recommendedAction == RepositoryAction.PUSH) authPurpose = AuthPurpose.SYNCHRONIZE else synchronize() },
+                            { commitPurpose = CommitPurpose.PUSH },
+                            { if (baseStatus.recommendedAction == RepositoryAction.PUSH) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
                             { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp))
                     }
                 }
@@ -683,11 +668,11 @@ private fun RobGitScreen(
         onGrantAccess = ::requestWorkspaceAccess,
         onAction = { action ->
             when (action) {
-                SharedWorkspaceAction.PUSH -> authPurpose = AuthPurpose.WORKSPACE_PUSH
+                SharedWorkspaceAction.PUSH -> commitPurpose = CommitPurpose.WORKSPACE_PUSH
                 SharedWorkspaceAction.PREPARE -> runSharedWorkspace(action)
                 SharedWorkspaceAction.ANALYZE -> runSharedWorkspace(action)
                 SharedWorkspaceAction.PULL -> runSharedWorkspace(action)
-                SharedWorkspaceAction.SYNCHRONIZE -> runSharedWorkspace(action)
+                SharedWorkspaceAction.SYNCHRONIZE -> commitPurpose = CommitPurpose.WORKSPACE_SYNCHRONIZE
                 SharedWorkspaceAction.FILESYSTEM -> runSharedWorkspace(action)
             }
         },
@@ -708,39 +693,34 @@ private fun RobGitScreen(
                 remoteDiagnostic = withContext(Dispatchers.IO) { gitService.runRemoteCloneDiagnostic(File(diagnosticRoot, "remote-clones/${UUID.randomUUID()}")) }
                 runningOperation = null
             }
-        }, { authPurpose = AuthPurpose.DIAGNOSTIC }, {
+        }, {
+            if (runningOperation == null) {
+                runningOperation = "diagnóstico push"
+                scope.launch {
+                    try {
+                        pushDiagnostic = withContext(Dispatchers.IO) {
+                            gitOperations.authenticatedDiagnostic(gitService,
+                                File(diagnosticRoot, "authenticated-push/${UUID.randomUUID()}"))
+                        }
+                    } catch (failure: GitAccessUnavailableException) {
+                        setNotice(failure.message.orEmpty(), "No se realizó ningún push de diagnóstico.")
+                    } finally { runningOperation = null }
+                }
+            }
+        }, {
             showSettings = false
             sharedWorkspaceResult = null
             activeWorkspaceOperation = null
             showSharedWorkspace = true
         })
-    authPurpose?.let { purpose ->
-        AuthenticationDialog(purpose, { authPurpose = null }) { token, message ->
-            authPurpose = null
+    commitPurpose?.let { purpose ->
+        CommitMessageDialog({ commitPurpose = null }) { message ->
+            commitPurpose = null
             when (purpose) {
-                AuthPurpose.PREPARE -> prepareRepository(token)
-                AuthPurpose.ANALYZE -> analyze(token)
-                AuthPurpose.PULL -> pull(token)
-                AuthPurpose.PUSH -> upload(token, message)
-                AuthPurpose.SYNCHRONIZE -> synchronize(token, message)
-                AuthPurpose.MIGRATION -> {
-                    val config = catalog?.repositories?.firstOrNull { it.id == migrationTargetId }
-                    if (config != null) runMigration(config, token) else token.fill('\u0000')
-                }
-                AuthPurpose.WORKSPACE_PREPARE -> runSharedWorkspace(SharedWorkspaceAction.PREPARE, token, message)
-                AuthPurpose.WORKSPACE_ANALYZE -> runSharedWorkspace(SharedWorkspaceAction.ANALYZE, token, message)
-                AuthPurpose.WORKSPACE_PULL -> runSharedWorkspace(SharedWorkspaceAction.PULL, token, message)
-                AuthPurpose.WORKSPACE_PUSH -> runSharedWorkspace(SharedWorkspaceAction.PUSH, token, message)
-                AuthPurpose.WORKSPACE_SYNCHRONIZE -> runSharedWorkspace(SharedWorkspaceAction.SYNCHRONIZE, token, message)
-                AuthPurpose.DIAGNOSTIC -> {
-                    runningOperation = "diagnóstico push"; scope.launch {
-                        try {
-                            pushDiagnostic = withContext(Dispatchers.IO) {
-                                gitService.runAuthenticatedPushDiagnostic(File(diagnosticRoot, "authenticated-push/${UUID.randomUUID()}"), token)
-                            }
-                        } finally { token.fill('\u0000'); runningOperation = null }
-                    }
-                }
+                CommitPurpose.PUSH -> upload(message)
+                CommitPurpose.SYNCHRONIZE -> synchronize(message)
+                CommitPurpose.WORKSPACE_PUSH -> runSharedWorkspace(SharedWorkspaceAction.PUSH, message)
+                CommitPurpose.WORKSPACE_SYNCHRONIZE -> runSharedWorkspace(SharedWorkspaceAction.SYNCHRONIZE, message)
             }
         }
     }
@@ -919,19 +899,13 @@ private fun RobGitActionButton(icon: String, label: String, visual: ActionButton
 }
 
 @Composable
-private fun AuthenticationDialog(purpose: AuthPurpose, onDismiss: () -> Unit, onConfirm: (CharArray, String) -> Unit) {
-    var token by remember { mutableStateOf("") }; var message by remember { mutableStateOf("Cambios desde RobGit") }
-    AlertDialog(onDismissRequest = { token = ""; onDismiss() }, title = { Text(if (purpose == AuthPurpose.DIAGNOSTIC) "Prueba autenticada" else "Autorizar en GitHub") }, text = {
-        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("El token solo se conserva en memoria durante esta operación.")
-            OutlinedTextField(token, { token = it }, label = { Text("Token GitHub") }, visualTransformation = PasswordVisualTransformation(), keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false), singleLine = true)
-            if (purpose == AuthPurpose.PUSH || purpose == AuthPurpose.SYNCHRONIZE ||
-                purpose == AuthPurpose.WORKSPACE_PUSH || purpose == AuthPurpose.WORKSPACE_SYNCHRONIZE
-            ) OutlinedTextField(message, { message = it }, label = { Text("Mensaje del cambio") }, singleLine = true)
-        }
-    }, confirmButton = { Button(enabled = token.isNotBlank() &&
-        ((purpose != AuthPurpose.PUSH && purpose != AuthPurpose.SYNCHRONIZE && purpose != AuthPurpose.WORKSPACE_PUSH && purpose != AuthPurpose.WORKSPACE_SYNCHRONIZE) || message.isNotBlank()),
-        onClick = { val secret = token.toCharArray(); token = ""; onConfirm(secret, message.trim()) }) { Text("CONTINUAR") } }, dismissButton = { TextButton(onClick = { token = ""; onDismiss() }) { Text("CANCELAR") } })
+private fun CommitMessageDialog(onDismiss: () -> Unit, onConfirm: (String) -> Unit) {
+    var message by remember { mutableStateOf("Cambios desde RobGit") }
+    AlertDialog(onDismissRequest = onDismiss, title = { Text("Mensaje del cambio") }, text = {
+        OutlinedTextField(message, { message = it }, label = { Text("Mensaje del cambio") }, singleLine = true)
+    }, confirmButton = { Button(enabled = message.isNotBlank(), onClick = { onConfirm(message.trim()) }) {
+        Text("CONTINUAR")
+    } }, dismissButton = { TextButton(onClick = onDismiss) { Text("CANCELAR") } })
 }
 
 @Composable
@@ -1120,9 +1094,9 @@ internal val lastOperationSaver = Saver<RestoredOperation?, Any>(save = { it?.le
     val v = saved as? List<*> ?: return@Saver null
     RestoredOperation(v.getOrNull(0) as? String ?: return@Saver null, v.getOrNull(1) as? String ?: return@Saver null, v.getOrNull(2) as? String ?: return@Saver null, v.getOrNull(3) as? String)
 })
-internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(save = { s -> s?.let { listOf(it.type.name, it.relation.name, it.message, it.branch, it.localHead, it.remoteHead, it.ahead, it.behind, it.changes.newFiles.toList(), it.changes.modifiedFiles.toList(), it.changes.deletedFiles.toList(), it.changes.stagedFiles.toList(), it.changes.conflictingFiles.toList(), it.checkedAt.toString(), it.remoteStateIsFresh, it.error, it.authenticationRequired) } }, restore = { saved ->
+internal val repositoryStateSaver = Saver<RepositoryStateSnapshot?, Any>(save = { s -> s?.let { listOf(it.type.name, it.relation.name, it.message, it.branch, it.localHead, it.remoteHead, it.ahead, it.behind, it.changes.newFiles.toList(), it.changes.modifiedFiles.toList(), it.changes.deletedFiles.toList(), it.changes.stagedFiles.toList(), it.changes.conflictingFiles.toList(), it.checkedAt.toString(), it.remoteStateIsFresh, it.error, it.authenticationRequired, it.authenticationRejected, it.repositoryAccessDenied) } }, restore = { saved ->
     val v = saved as? List<*> ?: return@Saver null
     fun str(i: Int) = v.getOrNull(i) as? String
     fun files(i: Int) = (v.getOrNull(i) as? List<*>)?.mapNotNull { it as? String }?.toSet() ?: emptySet()
-    RepositoryStateSnapshot(str(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() } ?: return@Saver null, str(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() } ?: return@Saver null, str(2) ?: return@Saver null, str(3), str(4), str(5), v.getOrNull(6) as? Int ?: return@Saver null, v.getOrNull(7) as? Int ?: return@Saver null, WorkingTreeChanges(files(8), files(9), files(10), files(11), files(12)), str(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() } ?: return@Saver null, v.getOrNull(14) as? Boolean ?: return@Saver null, str(15), v.getOrNull(16) as? Boolean ?: false)
+    RepositoryStateSnapshot(str(0)?.let { runCatching { RepositoryStateType.valueOf(it) }.getOrNull() } ?: return@Saver null, str(1)?.let { runCatching { CommitRelation.valueOf(it) }.getOrNull() } ?: return@Saver null, str(2) ?: return@Saver null, str(3), str(4), str(5), v.getOrNull(6) as? Int ?: return@Saver null, v.getOrNull(7) as? Int ?: return@Saver null, WorkingTreeChanges(files(8), files(9), files(10), files(11), files(12)), str(13)?.let { runCatching { java.time.Instant.parse(it) }.getOrNull() } ?: return@Saver null, v.getOrNull(14) as? Boolean ?: return@Saver null, str(15), v.getOrNull(16) as? Boolean ?: false, v.getOrNull(17) as? Boolean ?: false, v.getOrNull(18) as? Boolean ?: false)
 })

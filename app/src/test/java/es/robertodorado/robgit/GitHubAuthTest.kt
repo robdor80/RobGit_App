@@ -202,6 +202,16 @@ class GitHubAuthTest {
         assertEquals(GitHubConnectionState.NeedsReauth, service.state.value)
     }
 
+    @Test fun explicitGitAuthenticationRejectionClearsTokensAndCannotReuseSession() = runTest {
+        val store = FakeStore(tokens = tokens())
+        val service = service(store)
+        service.reportAuthenticationRejected()
+        assertNull(store.tokens)
+        assertEquals(GitHubConnectionState.NeedsReauth, service.state.value)
+        assertNull(service.validAccessToken())
+        assertEquals(GitHubConnectionState.NeedsReauth, service.state.value)
+    }
+
     @Test fun missingLocalConfigurationDisablesAuthorization() = runTest {
         val service = GitHubAuthService(GitHubOAuthConfig("", ""), FakeStore(), FakeClient(), clock)
         assertNull(service.beginAuthorization())

@@ -139,20 +139,31 @@ internal interface GitHubOAuthClient {
     suspend fun login(accessToken: String): String
 }
 
+internal interface GitHubAccessTokenProvider {
+    val state: StateFlow<GitHubConnectionState>
+    suspend fun validAccessToken(): String?
+    suspend fun reportAuthenticationRejected()
+}
+
 internal class GitHubAuthService(
     private val config: GitHubOAuthConfig,
     private val store: GitHubAuthStore,
     private val client: GitHubOAuthClient,
     private val clock: Clock = Clock.systemUTC(),
-) {
+) : GitHubAccessTokenProvider {
     private val mutex = Mutex()
     private val mutableState = MutableStateFlow<GitHubConnectionState>(
         if (config.configured) GitHubConnectionState.Disconnected else GitHubConnectionState.NotConfigured,
     )
-    val state: StateFlow<GitHubConnectionState> = mutableState
+    override val state: StateFlow<GitHubConnectionState> = mutableState
+    private var rejectedSession = false
     private fun now(): Long = clock.instant().epochSecond
 
     suspend fun restore() = mutex.withLock {
+        if (rejectedSession) {
+            mutableState.value = GitHubConnectionState.NeedsReauth
+            return@withLock
+        }
         if (!config.configured) {
             mutableState.value = GitHubConnectionState.NotConfigured
             return@withLock
@@ -182,6 +193,7 @@ internal class GitHubAuthService(
             val state = GitHubPkce.freshState()
             val verifier = GitHubPkce.freshVerifier()
             store.clearAll()
+            rejectedSession = false
             store.writePending(OAuthPending(state, verifier, now()))
             mutableState.value = GitHubConnectionState.Authorizing
             val query = listOf(
@@ -239,7 +251,8 @@ internal class GitHubAuthService(
         }
     }
 
-    suspend fun validAccessToken(): String? = mutex.withLock {
+    override suspend fun validAccessToken(): String? = mutex.withLock {
+        if (rejectedSession || mutableState.value == GitHubConnectionState.NeedsReauth) return@withLock null
         if (!config.configured) {
             mutableState.value = GitHubConnectionState.NotConfigured
             return@withLock null
@@ -256,6 +269,12 @@ internal class GitHubAuthService(
         }
     }
 
+    override suspend fun reportAuthenticationRejected() = mutex.withLock {
+        rejectedSession = true
+        runCatching { store.clearTokens() }
+        mutableState.value = GitHubConnectionState.NeedsReauth
+    }
+
     private suspend fun validAccessTokenLocked(tokens: OAuthTokens): String? {
         val time = now()
         if (tokens.accessExpiresAt - time > ACCESS_EXPIRY_MARGIN_SECONDS) {
@@ -264,6 +283,7 @@ internal class GitHubAuthService(
         }
         if (tokens.refreshExpiresAt <= time) {
             store.clearTokens()
+            rejectedSession = true
             mutableState.value = GitHubConnectionState.NeedsReauth
             return null
         }
@@ -279,6 +299,7 @@ internal class GitHubAuthService(
             null
         } catch (_: Exception) {
             runCatching { store.clearTokens() }
+            rejectedSession = true
             mutableState.value = GitHubConnectionState.NeedsReauth
             null
         }
@@ -287,6 +308,7 @@ internal class GitHubAuthService(
     suspend fun disconnect() = mutex.withLock {
         try {
             store.clearAll()
+            rejectedSession = false
             mutableState.value = if (config.configured) GitHubConnectionState.Disconnected else GitHubConnectionState.NotConfigured
         } catch (_: Exception) {
             mutableState.value = GitHubConnectionState.Error("No se pudo borrar la conexión local.")

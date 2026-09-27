@@ -18,6 +18,7 @@ data class SharedWorkspaceResult(
     val state: RepositoryStateSnapshot? = null,
     val outcome: String? = null,
     val authenticationRequired: Boolean = false,
+    val authenticationRejected: Boolean = false,
 )
 
 /** Isolated diagnostic harness; it never reads or modifies RepositoryRegistry. */
@@ -38,12 +39,14 @@ class SharedWorkspaceProbe(
             val prepared = service.prepare(path, token)
             if (!prepared.success) {
                 SharedWorkspaceResult("PREPARAR WORKSPACE", false, prepared.message, path.absolutePath,
-                    authenticationRequired = prepared.authenticationRequired)
+                    authenticationRequired = prepared.authenticationRequired,
+                    authenticationRejected = prepared.authenticationRejected)
             } else {
                 val state = service.refreshState(path, refreshToken)
                 SharedWorkspaceResult("PREPARAR WORKSPACE", true,
                     if (state.authenticationRequired) "Workspace preparado; se necesita autorización para consultar GitHub." else prepared.message,
-                    path.absolutePath, state, authenticationRequired = state.authenticationRequired)
+                    path.absolutePath, state, authenticationRequired = state.authenticationRequired,
+                    authenticationRejected = state.authenticationRejected)
             }
         } finally {
             refreshToken.fill('\u0000')
@@ -53,21 +56,24 @@ class SharedWorkspaceProbe(
     fun analyze(token: CharArray = charArrayOf()): SharedWorkspaceResult = guarded("ANALIZAR WORKSPACE", token) { path ->
         val state = service().refreshState(path, token)
         SharedWorkspaceResult("ANALIZAR WORKSPACE", state.type != RepositoryStateType.ERROR,
-            state.message, path.absolutePath, state, state.type.name, state.authenticationRequired)
+            state.message, path.absolutePath, state, state.type.name, state.authenticationRequired,
+            state.authenticationRejected)
     }
 
     fun pull(token: CharArray = charArrayOf()): SharedWorkspaceResult = guarded("PULL DE PRUEBA", token) { path ->
         val result = service().downloadFastForward(path, token)
         SharedWorkspaceResult("PULL DE PRUEBA", result.outcome in setOf(DownloadOutcome.SUCCESS, DownloadOutcome.ALREADY_SYNCHRONIZED),
             result.message, path.absolutePath, result.finalState, result.outcome.name,
-            result.finalState?.authenticationRequired == true)
+            result.finalState?.authenticationRequired == true,
+            result.finalState?.authenticationRejected == true)
     }
 
     fun push(token: CharArray, message: String): SharedWorkspaceResult = guarded("PUSH DE PRUEBA", token) { path ->
         val result = service().uploadSafely(path, token, message)
         SharedWorkspaceResult("PUSH DE PRUEBA", result.outcome in setOf(UploadOutcome.SUCCESS, UploadOutcome.NOTHING_TO_UPLOAD),
             result.message, path.absolutePath, result.finalState, result.outcome.name,
-            result.outcome == UploadOutcome.AUTH_REQUIRED)
+            result.outcome == UploadOutcome.AUTH_REQUIRED || result.outcome == UploadOutcome.AUTH_FAILED,
+            result.authenticationRejected)
     }
 
     fun synchronize(token: CharArray = charArrayOf(), message: String = "Cambios desde RobGit (workspace de prueba)"):
@@ -76,7 +82,9 @@ class SharedWorkspaceProbe(
         SharedWorkspaceResult("SINCRONIZAR WORKSPACE",
             result.outcome in setOf(SynchronizationOutcome.NOTHING_TO_DO, SynchronizationOutcome.SUCCESS_DOWNLOADED,
                 SynchronizationOutcome.SUCCESS_UPLOADED), result.message, path.absolutePath,
-            result.finalState, result.outcome.name, result.outcome == SynchronizationOutcome.AUTH_REQUIRED)
+            result.finalState, result.outcome.name, result.outcome == SynchronizationOutcome.AUTH_REQUIRED ||
+                result.outcome == SynchronizationOutcome.AUTH_FAILED,
+            result.finalState?.authenticationRejected == true || result.uploadResult?.authenticationRejected == true)
     }
 
     /** Exercises local file operations only inside a uniquely named directory under this repo's .git. */
