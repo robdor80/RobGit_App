@@ -2,6 +2,7 @@ package es.robertodorado.robgit
 
 import android.content.pm.ActivityInfo
 import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
@@ -50,6 +51,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -58,11 +60,15 @@ import java.util.UUID
 class MainActivity : ComponentActivity() {
     private val foregroundPolicy = ForegroundRefreshPolicy()
     private var foregroundReturn by mutableIntStateOf(0)
+    private var authCallback by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         val tablet = resources.configuration.smallestScreenWidthDp >= 600
         requestedOrientation = if (tablet) ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
         super.onCreate(savedInstanceState)
+        authCallback = intent?.takeIf { it.action == Intent.ACTION_VIEW }?.dataString
+        val oauthConfig = GitHubOAuthConfig(BuildConfig.ROBGIT_GITHUB_CLIENT_ID, BuildConfig.ROBGIT_GITHUB_CLIENT_SECRET)
+        val authService = GitHubAuthService(oauthConfig, EncryptedGitHubAuthStore(this), HttpGitHubOAuthClient(oauthConfig))
         val diagnosticRoot = File(filesDir, "diagnostics")
         val registry = RepositoryRegistry(File(filesDir, "repositories.properties"), File(filesDir, "repos"))
         @Suppress("DEPRECATION")
@@ -75,10 +81,16 @@ class MainActivity : ComponentActivity() {
             RobGitTheme {
                 RobGitScreen(
                     diagnosticRoot, remember { GitRepositoryService() }, registry, workspaceResolver,
-                    migrationManager, foregroundReturn,
+                    migrationManager, foregroundReturn, authService, authCallback, { authCallback = null },
                 )
             }
         }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        authCallback = intent.takeIf { it.action == Intent.ACTION_VIEW }?.dataString
     }
 
     override fun onStart() {
@@ -103,6 +115,9 @@ private fun RobGitScreen(
     workspaceResolver: RepositoryWorkspaceResolver,
     migrationManager: RepositoryMigrationManager,
     foregroundReturn: Int,
+    authService: GitHubAuthService,
+    authCallback: String?,
+    onAuthCallbackConsumed: () -> Unit,
 ) {
     var catalog by remember { mutableStateOf<RepositoryCatalog?>(null) }
     var uiRepositoryId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -159,6 +174,45 @@ private fun RobGitScreen(
         hasAllFilesAccess = Environment.isExternalStorageManager()
     }
     val scope = rememberCoroutineScope()
+    val githubState by authService.state.collectAsState()
+
+    LaunchedEffect(authService) {
+        withContext(Dispatchers.IO) { authService.restore() }
+    }
+    LaunchedEffect(foregroundReturn) {
+        if (foregroundReturn > 0 && authCallback == null) {
+            withContext(Dispatchers.IO) { authService.restore() }
+        }
+    }
+    LaunchedEffect(authService) {
+        while (true) {
+            delay(60_000)
+            if (authService.state.value is GitHubConnectionState.Connected ||
+                (authService.state.value as? GitHubConnectionState.Error)?.retryable == true
+            ) withContext(Dispatchers.IO) { authService.validAccessToken() }
+        }
+    }
+    LaunchedEffect(authService, authCallback) {
+        if (authCallback != null) {
+            withContext(Dispatchers.IO) { authService.handleCallback(authCallback) }
+            onAuthCallbackConsumed()
+        }
+    }
+
+    fun connectGitHub() {
+        scope.launch {
+            val authorizationUrl = withContext(Dispatchers.IO) { authService.beginAuthorization() } ?: return@launch
+            try {
+                context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(authorizationUrl)).addCategory(Intent.CATEGORY_BROWSABLE))
+            } catch (_: Exception) {
+                withContext(Dispatchers.IO) { authService.cancelAuthorization() }
+            }
+        }
+    }
+
+    fun disconnectGitHub() {
+        scope.launch { withContext(Dispatchers.IO) { authService.disconnect() } }
+    }
 
     fun requestWorkspaceAccess() {
         val packageSettings = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
@@ -640,7 +694,8 @@ private fun RobGitScreen(
         onDismiss = { showSharedWorkspace = false; sharedWorkspaceResult = null; activeWorkspaceOperation = null },
     )
     if (showSettings) SettingsDialog(runningOperation, catalog, preparedRepositories, pendingMigrations.orEmpty(), hasAllFilesAccess,
-        migrationJournalError != null, localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
+        migrationJournalError != null, githubState, ::connectGitHub, ::disconnectGitHub,
+        localDiagnostic, remoteDiagnostic, pushDiagnostic, { showSettings = false },
         { config -> showSettings = false; pendingRemoval = config },
         { config -> showSettings = false; confirmMigration = config },
         {
@@ -944,9 +999,26 @@ private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, 
 @Composable private fun TechnicalFiles(label: String, files: Set<String>) { Text("$label (${files.size}): ${if (files.isEmpty()) "—" else files.joinToString()}") }
 
 @Composable
-private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepared: Map<String, Boolean>, pending: List<MigrationRecord>, permissionGranted: Boolean, journalBlocked: Boolean, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onRemove: (RepositoryConfig) -> Unit, onMigrate: (RepositoryConfig) -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit, onSharedWorkspace: () -> Unit) {
+private fun SettingsDialog(running: String?, catalog: RepositoryCatalog?, prepared: Map<String, Boolean>, pending: List<MigrationRecord>, permissionGranted: Boolean, journalBlocked: Boolean, githubState: GitHubConnectionState, onGitHubConnect: () -> Unit, onGitHubDisconnect: () -> Unit, localResult: DiagnosticResult?, remoteResult: DiagnosticResult?, pushResult: DiagnosticResult?, onDismiss: () -> Unit, onRemove: (RepositoryConfig) -> Unit, onMigrate: (RepositoryConfig) -> Unit, onLocal: () -> Unit, onRemote: () -> Unit, onAuthenticated: () -> Unit, onSharedWorkspace: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Ajustes") }, text = {
         Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("CONEXIÓN CON GITHUB", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
+            Text(when (githubState) {
+                GitHubConnectionState.NotConfigured -> "OAuth no está configurado localmente."
+                GitHubConnectionState.Disconnected -> "No conectado"
+                GitHubConnectionState.Authorizing -> "Esperando autorización de GitHub…"
+                is GitHubConnectionState.Connected -> "Conectado como ${githubState.login}"
+                GitHubConnectionState.Refreshing -> "Renovando conexión con GitHub…"
+                GitHubConnectionState.NeedsReauth -> "Es necesario volver a conectar GitHub"
+                is GitHubConnectionState.Error -> githubState.message
+            })
+            Button(onGitHubConnect, enabled = running == null && githubState != GitHubConnectionState.NotConfigured &&
+                githubState != GitHubConnectionState.Authorizing && githubState != GitHubConnectionState.Refreshing,
+                modifier = Modifier.fillMaxWidth()) { Text("CONECTAR CON GITHUB") }
+            OutlinedButton(onGitHubDisconnect, enabled = running == null && githubState != GitHubConnectionState.Disconnected &&
+                githubState != GitHubConnectionState.NotConfigured && githubState != GitHubConnectionState.Refreshing,
+                modifier = Modifier.fillMaxWidth()) { Text("DESCONECTAR") }
+            HorizontalDivider(color = RobGitColors.Ice.copy(alpha = .35f))
             Text("REPOSITORIOS", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
             catalog?.repositories?.forEach { config ->
                 Text(config.displayName, fontWeight = FontWeight.Bold)
