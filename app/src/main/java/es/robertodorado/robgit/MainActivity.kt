@@ -171,6 +171,8 @@ private fun RobGitScreen(
     val scope = rememberCoroutineScope()
     val githubState by authService.state.collectAsState()
     val gitOperations = remember(authService) { GitHubGitOperations(authService) }
+    val aiContextBuilder = remember { AiContextBuilder() }
+    val aiAssistantService = remember { AiAssistantService(DevelopmentAiProvider()) }
 
     LaunchedEffect(authService) {
         withContext(Dispatchers.IO) { authService.restore() }
@@ -607,7 +609,12 @@ private fun RobGitScreen(
         }
     }
     if (showTechnical) TechnicalDetailsDialog(selectedRepository, technicalDirectory, backupDirectory, repositoryState, lastOperation) { showTechnical = false }
-    if (showAi) AiAssistantDialog { showAi = false }
+    if (showAi) AiAssistantDialog(
+        context = aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,
+            lastOperation?.let { AiLastOperation(it.operation, it.outcome, it.message, it.detail) }),
+        service = aiAssistantService,
+        onDismiss = { showAi = false },
+    )
     if (showAddRepository) AddRepositoryDialog(
         error = addError,
         busy = runningOperation != null,
@@ -927,19 +934,6 @@ private fun CommitMessageDialog(onDismiss: () -> Unit, onConfirm: (String) -> Un
     }, confirmButton = { Button(enabled = message.isNotBlank(), onClick = { onConfirm(message.trim()) }) {
         Text("CONTINUAR")
     } }, dismissButton = { TextButton(onClick = onDismiss) { Text("CANCELAR") } })
-}
-
-@Composable
-private fun AiAssistantDialog(onDismiss: () -> Unit) {
-    val commands = listOf("Analizar el repositorio", "Explícame el estado actual", "¿Qué debería hacer ahora?", "Resumir los cambios", "Explicar un bloqueo o conflicto", "Pregunta personalizada")
-    var selected by remember { mutableStateOf(commands.first()) }; var menu by remember { mutableStateOf(false) }; var question by remember { mutableStateOf("") }; var attempted by remember { mutableStateOf(false) }
-    AlertDialog(onDismissRequest = onDismiss, title = { Text("Asistente RobGit") }, text = {
-        Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Box { OutlinedButton({ menu = true }, Modifier.fillMaxWidth()) { Text("$selected  ▾") }; DropdownMenu(menu, { menu = false }) { commands.forEach { c -> DropdownMenuItem({ Text(c) }, { selected = c; menu = false }) } } }
-            OutlinedTextField(question, { question = it }, label = { Text("Pregunta libre") }, minLines = 3, modifier = Modifier.fillMaxWidth())
-            if (attempted) Text("El asistente IA todavía no está conectado. La interfaz está preparada para el próximo hito.", color = RobGitColors.Ai)
-        }
-    }, confirmButton = { Button({ attempted = true }) { Text("PREGUNTAR") } }, dismissButton = { TextButton(onDismiss) { Text("CERRAR") } })
 }
 
 @Composable
