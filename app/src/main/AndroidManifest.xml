@@ -8,6 +8,7 @@
         android:icon="@mipmap/ic_launcher"
         android:label="RobGit"
         android:roundIcon="@mipmap/ic_launcher_round"
+        android:name=".RobGitApplication"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
         <activity
             android:name=".MainActivity"

@@ -26,57 +26,150 @@ import kotlinx.coroutines.launch
 
 /** Displays text responses. Receives no callback for analysis or any Git action. */
 @Composable
-internal fun AiAssistantDialog(context: AiContext, service: AiAssistantService, onDismiss: () -> Unit) {
+internal fun AiAssistantDialog(
+    context: AiContext,
+    service: AiAssistantService,
+    onDismiss: () -> Unit,
+) {
     var selected by remember { mutableStateOf(AiTask.EXPLAIN_STATUS) }
     var menu by remember { mutableStateOf(false) }
     var question by remember { mutableStateOf("") }
     var running by remember { mutableStateOf(false) }
-    var result by remember(context, selected) { mutableStateOf<AiAssistantResult?>(null) }
+    var result by remember(context, selected) {
+        mutableStateOf<AiAssistantResult?>(null)
+    }
+
     val scope = rememberCoroutineScope()
 
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Asistente RobGit") },
+        title = {
+            Text("Asistente RobGit")
+        },
         text = {
-            Column(Modifier.verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Text("Modo de desarrollo: proveedor simulado local. La IA todavía no está conectada.", color = RobGitColors.Ai)
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
                 Box {
-                    OutlinedButton(onClick = { menu = true }, enabled = !running, modifier = Modifier.fillMaxWidth()) {
+                    OutlinedButton(
+                        onClick = { menu = true },
+                        enabled = !running,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
                         Text(selected.label + "  ▾")
                     }
-                    DropdownMenu(menu, { menu = false }) {
+
+                    DropdownMenu(
+                        expanded = menu,
+                        onDismissRequest = { menu = false },
+                    ) {
                         AiTask.entries.forEach { task ->
-                            DropdownMenuItem({ Text(task.label) }, { selected = task; menu = false })
+                            DropdownMenuItem(
+                                text = { Text(task.label) },
+                                onClick = {
+                                    selected = task
+                                    menu = false
+                                },
+                            )
                         }
                     }
                 }
+
                 OutlinedTextField(
-                    question, { question = it.take(AiContextFilter.MAX_QUESTION); result = null },
-                    label = { Text(if (selected == AiTask.CUSTOM_QUESTION) "Pregunta personalizada" else "Detalle adicional (opcional)") },
-                    minLines = 3, enabled = !running, modifier = Modifier.fillMaxWidth(),
+                    value = question,
+                    onValueChange = {
+                        question = it.take(AiContextFilter.MAX_QUESTION)
+                        result = null
+                    },
+                    label = {
+                        Text(
+                            if (selected == AiTask.CUSTOM_QUESTION) {
+                                "Pregunta personalizada"
+                            } else {
+                                "Detalle adicional (opcional)"
+                            }
+                        )
+                    },
+                    minLines = 3,
+                    enabled = !running,
+                    modifier = Modifier.fillMaxWidth(),
                 )
-                if (selected.requiresAnalyzedState && context.gitStatus == null && result == null) {
-                    Text(AiAssistantService.ANALYSIS_REQUIRED_MESSAGE, color = RobGitColors.Warning)
+
+                if (
+                    selected.requiresAnalyzedState &&
+                    context.gitStatus == null &&
+                    result == null
+                ) {
+                    Text(
+                        AiAssistantService.ANALYSIS_REQUIRED_MESSAGE,
+                        color = RobGitColors.Warning,
+                    )
                 }
-                if (running) Text("Preparando respuesta de demostración…", color = RobGitColors.Ai)
+
+                if (running) {
+                    Text(
+                        "Consultando a Gemini…",
+                        color = RobGitColors.Ai,
+                    )
+                }
+
                 when (val latest = result) {
-                    is AiAssistantResult.Completed -> Text(latest.response.text, color = RobGitColors.Ai)
-                    is AiAssistantResult.Unavailable -> Text(latest.message, color = RobGitColors.Warning)
-                    is AiAssistantResult.Failed -> Text(latest.message, color = RobGitColors.Warning)
+                    is AiAssistantResult.Completed -> {
+                        Text(
+                            latest.response.text,
+                            color = RobGitColors.Ai,
+                        )
+                    }
+
+                    is AiAssistantResult.Unavailable -> {
+                        Text(
+                            latest.message,
+                            color = RobGitColors.Warning,
+                        )
+                    }
+
+                    is AiAssistantResult.Failed -> {
+                        Text(
+                            latest.message,
+                            color = RobGitColors.Warning,
+                        )
+                    }
+
                     null -> Unit
                 }
             }
         },
         confirmButton = {
-            Button(enabled = !running, onClick = {
-                running = true
-                result = null
-                scope.launch {
-                    try { result = service.execute(selected, context, question) }
-                    finally { running = false }
-                }
-            }) { Text("PREGUNTAR") }
+            Button(
+                enabled = !running,
+                onClick = {
+                    running = true
+                    result = null
+
+                    scope.launch {
+                        try {
+                            result = service.execute(
+                                selected,
+                                context,
+                                question,
+                            )
+                        } finally {
+                            running = false
+                        }
+                    }
+                },
+            ) {
+                Text("PREGUNTAR")
+            }
         },
-        dismissButton = { TextButton(onClick = onDismiss) { Text("CERRAR") } },
+        dismissButton = {
+            TextButton(
+                onClick = onDismiss,
+                enabled = !running,
+            ) {
+                Text("CERRAR")
+            }
+        },
     )
 }

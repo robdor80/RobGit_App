@@ -4,20 +4,24 @@ import java.io.File
 
 /** The production bridge from OAuth to the existing, safety-checked synchronous Git engine. */
 internal class GitHubGitOperations(private val access: GitHubAccessTokenProvider) {
-    private suspend fun <T> withCredentials(required: Boolean, action: suspend (CharArray, Boolean) -> T): T {
-        val current = access.state.value
-        val token = if (current == GitHubConnectionState.NeedsReauth ||
-            current == GitHubConnectionState.Authorizing) null else access.validAccessToken()
-        if (token == null && (required || current is GitHubConnectionState.Connected ||
-                current == GitHubConnectionState.Refreshing ||
-                (current as? GitHubConnectionState.Error)?.retryable == true)) {
-            throw GitAccessUnavailableException(access.state.value)
+    private suspend fun <T> withCredentials(required: Boolean, performance: PullPerformanceRecorder? = null,
+                                           action: suspend (CharArray, Boolean) -> T): T {
+        val token = performance.measureSuspending(PullPhase.OAUTH) {
+            val current = access.state.value
+            val available = if (current == GitHubConnectionState.NeedsReauth ||
+                current == GitHubConnectionState.Authorizing) null else access.validAccessToken()
+            if (available == null && (required || current is GitHubConnectionState.Connected ||
+                    current == GitHubConnectionState.Refreshing ||
+                    (current as? GitHubConnectionState.Error)?.retryable == true)) {
+                throw GitAccessUnavailableException(access.state.value)
+            }
+            available
         }
-        val temporary = token?.toCharArray() ?: charArrayOf()
+        val temporary = performance.measure(PullPhase.TOKEN_COPY) { token?.toCharArray() ?: charArrayOf() }
         try {
             return action(temporary, token != null)
         } finally {
-            temporary.fill('\u0000')
+            performance.measure(PullPhase.OAUTH_CLEANUP) { temporary.fill('\u0000') }
         }
     }
 
@@ -40,13 +44,17 @@ internal class GitHubGitOperations(private val access: GitHubAccessTokenProvider
                 result.copy(repositoryAccessDenied = true) else result
         }
 
-    suspend fun pull(service: RepositoryGitEngine, directory: File): DownloadResult =
-        withCredentials(false) { token, authenticated ->
-            val result = service.downloadFastForward(directory, token)
-            if (authenticated && result.finalState?.authenticationRejected == true) access.reportAuthenticationRejected()
-            if (authenticated && result.finalState?.authenticationRequired == true &&
-                result.finalState.authenticationRejected.not())
-                result.copy(finalState = result.finalState.copy(repositoryAccessDenied = true)) else result
+    suspend fun pull(service: RepositoryGitEngine, directory: File,
+                     performance: PullPerformanceRecorder? = null): DownloadResult =
+        performance.measureSuspending(PullPhase.TOTAL) {
+            withCredentials(false, performance) { token, authenticated ->
+                val result = if (performance == null) service.downloadFastForward(directory, token)
+                    else service.downloadFastForward(directory, token, performance)
+                if (authenticated && result.finalState?.authenticationRejected == true) access.reportAuthenticationRejected()
+                if (authenticated && result.finalState?.authenticationRequired == true &&
+                    result.finalState.authenticationRejected.not())
+                    result.copy(finalState = result.finalState.copy(repositoryAccessDenied = true)) else result
+            }
         }
 
     suspend fun push(service: RepositoryGitEngine, directory: File, message: String): UploadResult =

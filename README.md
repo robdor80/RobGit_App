@@ -58,6 +58,8 @@ Cuando el estado conocido indica que GitHub está adelantado, el working tree es
 
 PULL no usa `pull` de JGit, `reset`, `force`, stash, checkout destructivo ni crea commits de merge. Se bloquea ante cambios locales, commits locales o divergencia; distingue también repositorio ya sincronizado, error de fetch y error general. Tras un fast-forward verifica que `HEAD` coincide exactamente con `origin/<rama configurada>`, que ahead/behind son cero y que el working tree está limpio.
 
+Después de ejecutar un PULL, **DETALLES TÉCNICOS → RENDIMIENTO ÚLTIMO PULL** muestra su tiempo total y las fases ejecutadas: OAuth, apertura/validación, fetch, grafo Git, cada lectura del working tree, guardia previa, fast-forward y validación final. El diagnóstico utiliza tiempo monotónico, incluye contadores de llamadas explícitas de RobGit y conserva el último informe de cada repositorio solo en memoria mientras el proceso siga vivo. No registra credenciales, rutas ni contenidos; también muestra las fases completadas si la operación se bloquea o falla. Esta instrumentación es únicamente diagnóstica: no elimina comprobaciones ni optimiza el PULL. La causa del coste en repositorios grandes debe determinarse con mediciones físicas en Android.
+
 La suite JVM incluye escenarios deterministas con remotos Git locales para un commit remoto, varios commits, operación idempotente, archivos modificados, untracked y staged, commits locales, divergencia, fallo de fetch y estado de UI obsoleto. También verifica contenido, refs, limpieza del working tree y ausencia de commits extra.
 
 ## Subida segura

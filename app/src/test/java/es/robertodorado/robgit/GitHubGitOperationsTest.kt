@@ -35,6 +35,38 @@ class GitHubGitOperationsTest {
         assertTrue(engine.lastArray!!.all { it == '\u0000' })
     }
 
+    @Test fun measuredPullKeepsLegacyEngineCompatibilityAndTimesOAuthAndTotal() = runTest {
+        var now = 0L
+        val performance = PullPerformanceRecorder { now++ }
+        val provider = FakeProvider(GitHubConnectionState.Connected("user"), "oauth-test-value")
+        val engine = FakeEngine()
+        val result = GitHubGitOperations(provider).pull(engine, directory, performance)
+        assertEquals(DownloadOutcome.ALREADY_SYNCHRONIZED, result.outcome)
+        assertEquals("oauth-test-value", engine.credentialsSeen.single())
+        assertTrue(engine.lastArray!!.all { it == '\u0000' })
+        val report = performance.snapshot()
+        assertEquals(listOf(PullPhase.OAUTH, PullPhase.TOKEN_COPY, PullPhase.OAUTH_CLEANUP, PullPhase.TOTAL),
+            report.timings.map { it.phase })
+        assertEquals(7L, report.totalNanos)
+        assertFalse(report.toString().contains("oauth-test-value"))
+    }
+
+    @Test fun failedOAuthPullStillRecordsPartialDiagnosticWithoutCallingEngine() = runTest {
+        val performance = PullPerformanceRecorder { 0 }
+        val provider = FakeProvider(GitHubConnectionState.Connected("user")).apply {
+            failureState = GitHubConnectionState.Error("private-test-error", retryable = true)
+        }
+        val engine = FakeEngine()
+        try {
+            GitHubGitOperations(provider).pull(engine, directory, performance)
+            fail("Expected authentication failure")
+        } catch (_: GitAccessUnavailableException) {
+            assertTrue(engine.credentialsSeen.isEmpty())
+        }
+        assertEquals(listOf(PullPhase.OAUTH, PullPhase.TOTAL), performance.snapshot().timings.map { it.phase })
+        assertFalse(performance.snapshot().toString().contains("private-test-error"))
+    }
+
     @Test fun pushWithoutSessionStopsBeforeEngineCall() = runTest {
         val engine = FakeEngine()
         try {

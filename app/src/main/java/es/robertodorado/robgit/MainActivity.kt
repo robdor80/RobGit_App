@@ -124,6 +124,7 @@ private fun RobGitScreen(
     var repositoryPrepared by rememberSaveable { mutableStateOf<Boolean?>(null) }
     var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
     var lastOperation by remember { mutableStateOf<RestoredOperation?>(null) }
+    val pullPerformanceByRepository by PullPerformanceStore.process.reports.collectAsState()
     var noticeTitle by remember { mutableStateOf<String?>(null) }
     var noticeBody by remember { mutableStateOf<String?>(null) }
     var noticeRecommendation by remember { mutableStateOf<String?>(null) }
@@ -172,7 +173,7 @@ private fun RobGitScreen(
     val githubState by authService.state.collectAsState()
     val gitOperations = remember(authService) { GitHubGitOperations(authService) }
     val aiContextBuilder = remember { AiContextBuilder() }
-    val aiAssistantService = remember { AiAssistantService(DevelopmentAiProvider()) }
+    val aiAssistantService = remember { AiAssistantService(FirebaseGeminiAiProvider()) }
 
     LaunchedEffect(authService) {
         withContext(Dispatchers.IO) { authService.restore() }
@@ -432,18 +433,23 @@ private fun RobGitScreen(
     fun pull() {
         val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
+        val repositoryId = selectedRepository?.id ?: return
         if (runningOperation != null) return
         runningOperation = "PULL"; clearNotice()
         scope.launch {
+            val performance = PullPerformanceRecorder()
             try {
-                val result = withContext(Dispatchers.IO) { gitOperations.pull(service, directory) }
+                val result = withContext(Dispatchers.IO) { gitOperations.pull(service, directory, performance) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("PULL", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
                 if (result.finalState?.authenticationRequired == true) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
             } catch (failure: GitAccessUnavailableException) {
                 setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
-            } finally { runningOperation = null }
+            } finally {
+                PullPerformanceStore.process.record(repositoryId, performance.snapshot())
+                runningOperation = null
+            }
         }
     }
     fun upload(commitMessage: String) {
@@ -608,7 +614,8 @@ private fun RobGitScreen(
             }
         }
     }
-    if (showTechnical) TechnicalDetailsDialog(selectedRepository, technicalDirectory, backupDirectory, repositoryState, lastOperation) { showTechnical = false }
+    if (showTechnical) TechnicalDetailsDialog(selectedRepository, technicalDirectory, backupDirectory, repositoryState,
+        lastOperation, pullPerformanceByRepository[selectedRepository?.id]) { showTechnical = false }
     if (showAi) AiAssistantDialog(
         context = aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,
             lastOperation?.let { AiLastOperation(it.operation, it.outcome, it.message, it.detail) }),
@@ -963,9 +970,16 @@ private fun AddRepositoryDialog(
 }
 
 @Composable
-private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, backupDirectory: File?, state: RepositoryStateSnapshot?, operation: RestoredOperation?, onDismiss: () -> Unit) {
+private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, backupDirectory: File?, state: RepositoryStateSnapshot?,
+                                   operation: RestoredOperation?, pullPerformance: PullPerformanceReport?, onDismiss: () -> Unit) {
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Detalles técnicos") }, text = {
         Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("RENDIMIENTO ÚLTIMO PULL", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
+            pullPerformanceLines(pullPerformance).forEach { Text(it) }
+            if (pullPerformance?.timings?.isNotEmpty() == true) {
+                Text("Total desde OAuth hasta completar la operación. Solo se muestran las fases ejecutadas.",
+                    style = MaterialTheme.typography.bodySmall)
+            }
             config?.let {
                 Text("Nombre: ${it.displayName}")
                 Text("URL: ${it.remoteUrl}")

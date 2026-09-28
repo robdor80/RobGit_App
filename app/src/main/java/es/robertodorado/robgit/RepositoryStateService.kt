@@ -150,6 +150,9 @@ interface RepositoryGitEngine {
     fun prepare(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryPreparationResult
     fun refreshState(repositoryDirectory: File, token: CharArray = charArrayOf()): RepositoryStateSnapshot
     fun downloadFastForward(repositoryDirectory: File, token: CharArray = charArrayOf()): DownloadResult
+    /** Optional per-call diagnostics; existing engines keep the original contract. */
+    fun downloadFastForward(repositoryDirectory: File, token: CharArray, performance: PullPerformanceRecorder): DownloadResult =
+        downloadFastForward(repositoryDirectory, token)
     fun uploadSafely(repositoryDirectory: File, token: CharArray, commitMessage: String): UploadResult
     fun synchronizeSafely(repositoryDirectory: File, token: CharArray, commitMessage: String): SynchronizationResult
 }
@@ -309,17 +312,29 @@ class RepositoryStateService(
     }
 
     /** Revalidates with fetch and applies only a verified fast-forward of main. */
-    override fun downloadFastForward(repositoryDirectory: File, token: CharArray): DownloadResult {
+    override fun downloadFastForward(repositoryDirectory: File, token: CharArray): DownloadResult =
+        downloadFastForwardMeasured(repositoryDirectory, token, null)
+
+    override fun downloadFastForward(repositoryDirectory: File, token: CharArray, performance: PullPerformanceRecorder): DownloadResult =
+        downloadFastForwardMeasured(repositoryDirectory, token, performance)
+
+    private fun downloadFastForwardMeasured(
+        repositoryDirectory: File, token: CharArray, performance: PullPerformanceRecorder?,
+    ): DownloadResult {
         val checkedAt = Instant.now()
-        val credentials = if (token.isNotEmpty()) githubJGitCredentials(token) else null
+        val credentials = performance.measure(PullPhase.JGIT_CREDENTIALS) {
+            if (token.isNotEmpty()) githubJGitCredentials(token) else null
+        }
         try {
-            check(File(repositoryDirectory, ".git").isDirectory) {
-                "El repositorio persistente todavía no está preparado."
-            }
-            Git.open(repositoryDirectory).use { git ->
-                validateFunctionalRepository(git)
+            performance.measure(PullPhase.OPEN_REPOSITORY) {
+                check(File(repositoryDirectory, ".git").isDirectory) {
+                    "El repositorio persistente todavía no está preparado."
+                }
+                Git.open(repositoryDirectory)
+            }.use { git ->
+                performance.measure(PullPhase.VALIDATE_REPOSITORY) { validateFunctionalRepository(git) }
                 try {
-                    fetchOrigin(git, credentials)
+                    performance.measure(PullPhase.FETCH) { fetchOrigin(git, credentials) }
                 } catch (failure: Throwable) {
                     if (failure !is Exception && failure !is LinkageError) throw failure
                     val failureState = errorSnapshot(
@@ -337,37 +352,43 @@ class RepositoryStateService(
                     )
                 }
 
-                val state = inspectFetchedState(git, checkedAt)
-                val blocked = blockedDownloadResult(state)
+                val state = inspectFetchedState(git, checkedAt, performance, PullInspection.INITIAL)
+                val blocked = performance.measure(PullPhase.INITIAL_POLICY) { blockedDownloadResult(state) }
                 if (blocked != null) return blocked
 
                 val repository = git.repository
-                val previousHead = repository.resolve(Constants.HEAD)
-                val fetchedRemoteHead = repository.resolve(remoteTrackingRef)
-                check(previousHead != null && fetchedRemoteHead != null)
+                val (previousHead, fetchedRemoteHead) = performance.measure(PullPhase.BASELINE_REFS) {
+                    val previous = repository.resolve(Constants.HEAD)
+                    val remote = repository.resolve(remoteTrackingRef)
+                    check(previous != null && remote != null)
+                    previous to remote
+                }
 
                 // Guard again immediately before MergeCommand in case local files or refs changed.
-                val immediateChanges = readWorkingTreeChanges(git)
-                val immediateLocalHead = repository.resolve(Constants.HEAD)
-                val immediateRemoteHead = repository.resolve(remoteTrackingRef)
-                if (immediateChanges.hasChanges ||
-                    immediateLocalHead != previousHead ||
-                    immediateRemoteHead != fetchedRemoteHead
-                ) {
-                    val latest = inspectFetchedState(git, Instant.now())
+                val immediateChanges = readWorkingTreeChanges(git, performance, PullPhase.GUARD_STATUS, PullPhase.GUARD_CHANGES)
+                val immediateLocalHead = performance.measure(PullPhase.GUARD_HEAD) { repository.resolve(Constants.HEAD) }
+                val immediateRemoteHead = performance.measure(PullPhase.GUARD_REMOTE_REF) { repository.resolve(remoteTrackingRef) }
+                val changed = performance.measure(PullPhase.GUARD_VALIDATE) {
+                    immediateChanges.hasChanges || immediateLocalHead != previousHead ||
+                        immediateRemoteHead != fetchedRemoteHead
+                }
+                if (changed) {
+                    val latest = inspectFetchedState(git, Instant.now(), performance, PullInspection.RECHECK)
                     return blockedDownloadResult(latest) ?: downloadError(
                         "El repositorio cambió durante la comprobación. No se realizó ningún cambio.",
                     )
                 }
 
-                val mergeResult = git.merge()
-                    .include(fetchedRemoteHead)
-                    .setFastForward(MergeCommand.FastForwardMode.FF_ONLY)
-                    .setCommit(false)
-                    .call()
+                val mergeResult = performance.measure(PullPhase.FAST_FORWARD) {
+                    git.merge()
+                        .include(fetchedRemoteHead)
+                        .setFastForward(MergeCommand.FastForwardMode.FF_ONLY)
+                        .setCommit(false)
+                        .call()
+                }
 
                 if (mergeResult.mergeStatus != MergeResult.MergeStatus.FAST_FORWARD) {
-                    val after = inspectFetchedState(git, Instant.now())
+                    val after = inspectFetchedState(git, Instant.now(), performance, PullInspection.RECHECK)
                     if (after.type == RepositoryStateType.SYNCHRONIZED) {
                         return DownloadResult(
                             outcome = DownloadOutcome.ALREADY_SYNCHRONIZED,
@@ -385,18 +406,21 @@ class RepositoryStateService(
                     )
                 }
 
-                val finalState = inspectFetchedState(git, Instant.now())
-                val newHead = repository.resolve(Constants.HEAD)
-                val finalRemoteHead = repository.resolve(remoteTrackingRef)
-                check(newHead == fetchedRemoteHead) {
-                    "HEAD no coincide con el commit remoto obtenido mediante fetch."
+                val finalState = inspectFetchedState(git, Instant.now(), performance, PullInspection.FINAL)
+                val newHead = performance.measure(PullPhase.FINAL_VALIDATE) {
+                    val finalHead = repository.resolve(Constants.HEAD)
+                    val finalRemoteHead = repository.resolve(remoteTrackingRef)
+                    check(finalHead == fetchedRemoteHead) {
+                        "HEAD no coincide con el commit remoto obtenido mediante fetch."
+                    }
+                    check(finalRemoteHead == fetchedRemoteHead) {
+                        "$remoteTrackingRef cambió durante la operación."
+                    }
+                    check(finalState.type == RepositoryStateType.SYNCHRONIZED)
+                    check(finalState.ahead == 0 && finalState.behind == 0)
+                    check(!finalState.changes.hasChanges) { "El working tree final no está limpio." }
+                    finalHead
                 }
-                check(finalRemoteHead == fetchedRemoteHead) {
-                    "$remoteTrackingRef cambió durante la operación."
-                }
-                check(finalState.type == RepositoryStateType.SYNCHRONIZED)
-                check(finalState.ahead == 0 && finalState.behind == 0)
-                check(!finalState.changes.hasChanges) { "El working tree final no está limpio." }
 
                 // HEAD is exactly the pre-existing fetched commit, so no merge commit was created.
                 return DownloadResult(
@@ -421,8 +445,10 @@ class RepositoryStateService(
                 ),
             )
         } finally {
-            credentials?.clear()
-            Arrays.fill(token, '\u0000')
+            performance.measure(PullPhase.ENGINE_CREDENTIAL_CLEANUP) {
+                credentials?.clear()
+                Arrays.fill(token, '\u0000')
+            }
         }
     }
 
@@ -1095,16 +1121,29 @@ class RepositoryStateService(
         remoteGateway.fetch(git, credentials)
     }
 
-    private fun inspectFetchedState(git: Git, checkedAt: Instant): RepositoryStateSnapshot {
-        val repository = git.repository
-        val branch = repository.branch
-        val localHead = repository.resolve(Constants.HEAD)
-        val remoteHead = repository.resolve(remoteTrackingRef)
-        check(localHead != null) { "HEAD local no existe." }
-        check(remoteHead != null) { "$remoteTrackingRef no existe después del fetch." }
+    private enum class PullInspection(
+        val refs: PullPhase, val graph: PullPhase, val status: PullPhase, val changes: PullPhase,
+    ) {
+        INITIAL(PullPhase.INITIAL_REFS, PullPhase.INITIAL_GRAPH, PullPhase.INITIAL_STATUS, PullPhase.INITIAL_CHANGES),
+        FINAL(PullPhase.FINAL_REFS, PullPhase.FINAL_GRAPH, PullPhase.FINAL_STATUS, PullPhase.FINAL_CHANGES),
+        RECHECK(PullPhase.RECHECK_REFS, PullPhase.RECHECK_GRAPH, PullPhase.RECHECK_STATUS, PullPhase.RECHECK_CHANGES),
+    }
 
-        val relation = calculateRelation(repository, localHead, remoteHead)
-        val changes = readWorkingTreeChanges(git)
+    private fun inspectFetchedState(git: Git, checkedAt: Instant,
+                                    performance: PullPerformanceRecorder? = null,
+                                    inspection: PullInspection = PullInspection.INITIAL): RepositoryStateSnapshot {
+        val repository = git.repository
+        val (branch, localHead, remoteHead) = performance.measure(inspection.refs) {
+            val currentBranch = repository.branch
+            val local = repository.resolve(Constants.HEAD)
+            val remote = repository.resolve(remoteTrackingRef)
+            check(local != null) { "HEAD local no existe." }
+            check(remote != null) { "$remoteTrackingRef no existe después del fetch." }
+            Triple(currentBranch, local, remote)
+        }
+
+        val relation = performance.measure(inspection.graph) { calculateRelation(repository, localHead, remoteHead, performance) }
+        val changes = readWorkingTreeChanges(git, performance, inspection.status, inspection.changes)
         val type = if (changes.hasChanges) {
             RepositoryStateType.LOCAL_CHANGES
         } else {
@@ -1181,14 +1220,15 @@ class RepositoryStateService(
         repository: Repository,
         localHead: ObjectId,
         remoteHead: ObjectId,
+        performance: PullPerformanceRecorder? = null,
     ): CommitCounts {
         if (localHead == remoteHead) {
             return CommitCounts(CommitRelation.SYNCHRONIZED, ahead = 0, behind = 0)
         }
-        val remoteIsAncestor = isMergedInto(repository, remoteHead, localHead)
-        val localIsAncestor = isMergedInto(repository, localHead, remoteHead)
-        val ahead = countExclusive(repository, localHead, remoteHead)
-        val behind = countExclusive(repository, remoteHead, localHead)
+        val remoteIsAncestor = isMergedInto(repository, remoteHead, localHead, performance)
+        val localIsAncestor = isMergedInto(repository, localHead, remoteHead, performance)
+        val ahead = countExclusive(repository, localHead, remoteHead, performance)
+        val behind = countExclusive(repository, remoteHead, localHead, performance)
         val relation = when {
             remoteIsAncestor && !localIsAncestor -> CommitRelation.LOCAL_AHEAD
             localIsAncestor && !remoteIsAncestor -> CommitRelation.REMOTE_AHEAD
@@ -1202,29 +1242,44 @@ class RepositoryStateService(
         repository: Repository,
         possibleAncestor: ObjectId,
         tip: ObjectId,
-    ): Boolean = RevWalk(repository).use { walk ->
-        walk.isMergedInto(walk.parseCommit(possibleAncestor), walk.parseCommit(tip))
+        performance: PullPerformanceRecorder? = null,
+    ): Boolean {
+        performance?.count(PullCounter.REV_WALK_CALLS)
+        return RevWalk(repository).use { walk ->
+            walk.isMergedInto(walk.parseCommit(possibleAncestor), walk.parseCommit(tip))
+        }
     }
 
     private fun countExclusive(
         repository: Repository,
         tip: ObjectId,
         excludedTip: ObjectId,
-    ): Int = RevWalk(repository).use { walk ->
-        walk.markStart(walk.parseCommit(tip))
-        walk.markUninteresting(walk.parseCommit(excludedTip))
-        walk.count()
+        performance: PullPerformanceRecorder? = null,
+    ): Int {
+        performance?.count(PullCounter.REV_WALK_CALLS)
+        return RevWalk(repository).use { walk ->
+            walk.markStart(walk.parseCommit(tip))
+            walk.markUninteresting(walk.parseCommit(excludedTip))
+            walk.count()
+        }
     }
 
-    private fun readWorkingTreeChanges(git: Git): WorkingTreeChanges {
-        val status = git.status().call()
-        return WorkingTreeChanges(
-            newFiles = (status.untracked + status.added).toSortedSet(),
-            modifiedFiles = (status.modified + status.changed).toSortedSet(),
-            deletedFiles = (status.missing + status.removed).toSortedSet(),
-            stagedFiles = (status.added + status.changed + status.removed).toSortedSet(),
-            conflictingFiles = status.conflicting.toSortedSet(),
-        )
+    private fun readWorkingTreeChanges(git: Git, performance: PullPerformanceRecorder? = null,
+                                       statusPhase: PullPhase = PullPhase.INITIAL_STATUS,
+                                       changesPhase: PullPhase = PullPhase.INITIAL_CHANGES): WorkingTreeChanges {
+        val status = performance.measure(statusPhase) {
+            performance?.count(PullCounter.STATUS_CALLS)
+            git.status().call()
+        }
+        return performance.measure(changesPhase) {
+            WorkingTreeChanges(
+                newFiles = (status.untracked + status.added).toSortedSet(),
+                modifiedFiles = (status.modified + status.changed).toSortedSet(),
+                deletedFiles = (status.missing + status.removed).toSortedSet(),
+                stagedFiles = (status.added + status.changed + status.removed).toSortedSet(),
+                conflictingFiles = status.conflicting.toSortedSet(),
+            )
+        }
     }
 
     private fun humanMessage(type: RepositoryStateType, ahead: Int, behind: Int): String = when (type) {

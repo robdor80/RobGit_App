@@ -193,7 +193,20 @@ class RepositoryStateServiceTest {
         val remoteHead = head(fixture.writer)
         val remoteCommitCount = commitCount(fixture.writer)
 
-        val result = fixture.service.downloadFastForward(fixture.local)
+        val performance = PullPerformanceRecorder { 0 }
+        val result = fixture.service.downloadFastForward(fixture.local, charArrayOf(), performance)
+        val report = performance.snapshot()
+        assertEquals(3, report.counters[PullCounter.STATUS_CALLS])
+        assertEquals(4, report.counters[PullCounter.REV_WALK_CALLS])
+        assertEquals(listOf(
+            PullPhase.JGIT_CREDENTIALS, PullPhase.OPEN_REPOSITORY, PullPhase.VALIDATE_REPOSITORY,
+            PullPhase.FETCH, PullPhase.INITIAL_REFS, PullPhase.INITIAL_GRAPH, PullPhase.INITIAL_STATUS,
+            PullPhase.INITIAL_CHANGES, PullPhase.INITIAL_POLICY, PullPhase.BASELINE_REFS,
+            PullPhase.GUARD_STATUS, PullPhase.GUARD_CHANGES, PullPhase.GUARD_HEAD,
+            PullPhase.GUARD_REMOTE_REF, PullPhase.GUARD_VALIDATE, PullPhase.FAST_FORWARD,
+            PullPhase.FINAL_REFS, PullPhase.FINAL_GRAPH, PullPhase.FINAL_STATUS,
+            PullPhase.FINAL_CHANGES, PullPhase.FINAL_VALIDATE, PullPhase.ENGINE_CREDENTIAL_CLEANUP,
+        ), report.timings.map { it.phase })
 
         assertEquals(result.error, DownloadOutcome.SUCCESS, result.outcome)
         assertEquals(previousHead, result.previousHead)
@@ -237,7 +250,13 @@ class RepositoryStateServiceTest {
         val previousContents = File(fixture.local, "tracked.txt").readText()
         val previousCommitCount = commitCount(fixture.local)
 
-        val result = fixture.service.downloadFastForward(fixture.local)
+        val performance = PullPerformanceRecorder { 0 }
+        val result = fixture.service.downloadFastForward(fixture.local, charArrayOf(), performance)
+        val report = performance.snapshot()
+        assertEquals(1, report.counters[PullCounter.STATUS_CALLS])
+        assertEquals(0, report.counters[PullCounter.REV_WALK_CALLS] ?: 0)
+        assertFalse(report.timings.any { it.phase == PullPhase.FAST_FORWARD || it.phase == PullPhase.GUARD_STATUS ||
+            it.phase == PullPhase.FINAL_STATUS })
 
         assertEquals(DownloadOutcome.ALREADY_SYNCHRONIZED, result.outcome)
         assertEquals(0, result.commitsDownloaded)
@@ -319,7 +338,11 @@ class RepositoryStateServiceTest {
         commitAndPush(fixture.writer, "remote.txt", "solo remoto", "solo remoto")
         val remoteHead = head(fixture.writer)
 
-        val result = fixture.service.downloadFastForward(fixture.local)
+        val performance = PullPerformanceRecorder { 0 }
+        val result = fixture.service.downloadFastForward(fixture.local, charArrayOf(), performance)
+        assertEquals(1, performance.snapshot().counters[PullCounter.STATUS_CALLS])
+        assertEquals(4, performance.snapshot().counters[PullCounter.REV_WALK_CALLS])
+        assertFalse(performance.snapshot().timings.any { it.phase == PullPhase.FAST_FORWARD })
 
         assertEquals(DownloadOutcome.DIVERGED, result.outcome)
         assertEquals(localHead, head(fixture.local))
@@ -347,8 +370,12 @@ class RepositoryStateServiceTest {
             git.repository.config.save()
         }
 
+        val performance = PullPerformanceRecorder { 0 }
         val result = RepositoryStateService(missingRemote.toURI().toString())
-            .downloadFastForward(fixture.local)
+            .downloadFastForward(fixture.local, charArrayOf(), performance)
+        assertTrue(performance.snapshot().timings.any { it.phase == PullPhase.FETCH })
+        assertEquals(0, performance.snapshot().counters[PullCounter.STATUS_CALLS] ?: 0)
+        assertFalse(performance.snapshot().timings.any { it.phase == PullPhase.FAST_FORWARD })
 
         assertEquals(DownloadOutcome.FETCH_ERROR, result.outcome)
         assertEquals(localHead, head(fixture.local))

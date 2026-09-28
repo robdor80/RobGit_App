@@ -4,12 +4,14 @@ plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
+    id("com.google.gms.google-services")
 }
 
 val oauthProperties = Properties().apply {
     val localFile = rootProject.file("local.properties")
     if (localFile.isFile) localFile.inputStream().use { load(it) }
 }
+
 fun oauthBuildString(value: String): String = "\"" + value
     .replace("\\", "\\\\")
     .replace("\"", "\\\"")
@@ -26,8 +28,18 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "0.1-spike"
-        buildConfigField("String", "ROBGIT_GITHUB_CLIENT_ID", oauthBuildString(oauthProperties.getProperty("ROBGIT_GITHUB_CLIENT_ID", "")))
-        buildConfigField("String", "ROBGIT_GITHUB_CLIENT_SECRET", oauthBuildString(oauthProperties.getProperty("ROBGIT_GITHUB_CLIENT_SECRET", "")))
+
+        buildConfigField(
+            "String",
+            "ROBGIT_GITHUB_CLIENT_ID",
+            oauthBuildString(oauthProperties.getProperty("ROBGIT_GITHUB_CLIENT_ID", ""))
+        )
+
+        buildConfigField(
+            "String",
+            "ROBGIT_GITHUB_CLIENT_SECRET",
+            oauthBuildString(oauthProperties.getProperty("ROBGIT_GITHUB_CLIENT_SECRET", ""))
+        )
     }
 
     compileOptions {
@@ -54,6 +66,11 @@ dependencies {
     implementation("org.eclipse.jgit:org.eclipse.jgit:7.8.0.202609011348-r")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("com.google.code.gson:gson:2.13.2")
+
+    // Firebase
+    implementation(platform("com.google.firebase:firebase-bom:34.19.0"))
+    implementation("com.google.firebase:firebase-ai")
+    implementation("com.google.firebase:firebase-appcheck-debug")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2")

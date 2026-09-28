@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "750896915226",
+    "project_id": "gen-lang-client-0431964852",
+    "storage_bucket": "gen-lang-client-0431964852.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:750896915226:android:3233538a571b90765d82a3",
+        "android_client_info": {
+          "package_name": "es.robertodorado.robgit"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBpBKt_U-ibR5VTHjJWLC6HBkS4-lK243Q"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
