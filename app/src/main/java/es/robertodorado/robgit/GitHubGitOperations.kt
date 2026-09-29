@@ -5,17 +5,20 @@ import java.io.File
 /** The production bridge from OAuth to the existing, safety-checked synchronous Git engine. */
 internal class GitHubGitOperations(private val access: GitHubAccessTokenProvider) {
     private suspend fun <T> withCredentials(required: Boolean, performance: PullPerformanceRecorder? = null,
+                                           syncPerformance: SyncPerformanceRecorder? = null,
                                            action: suspend (CharArray, Boolean) -> T): T {
-        val token = performance.measureSuspending(PullPhase.OAUTH) {
-            val current = access.state.value
-            val available = if (current == GitHubConnectionState.NeedsReauth ||
-                current == GitHubConnectionState.Authorizing) null else access.validAccessToken()
-            if (available == null && (required || current is GitHubConnectionState.Connected ||
-                    current == GitHubConnectionState.Refreshing ||
-                    (current as? GitHubConnectionState.Error)?.retryable == true)) {
-                throw GitAccessUnavailableException(access.state.value)
+        val token = syncPerformance.measureSuspending(SyncPhase.OAUTH) {
+            performance.measureSuspending(PullPhase.OAUTH) {
+                val current = access.state.value
+                val available = if (current == GitHubConnectionState.NeedsReauth ||
+                    current == GitHubConnectionState.Authorizing) null else access.validAccessToken()
+                if (available == null && (required || current is GitHubConnectionState.Connected ||
+                        current == GitHubConnectionState.Refreshing ||
+                        (current as? GitHubConnectionState.Error)?.retryable == true)) {
+                    throw GitAccessUnavailableException(access.state.value)
+                }
+                available
             }
-            available
         }
         val temporary = performance.measure(PullPhase.TOKEN_COPY) { token?.toCharArray() ?: charArrayOf() }
         try {
@@ -64,14 +67,18 @@ internal class GitHubGitOperations(private val access: GitHubAccessTokenProvider
             }
         }
 
-    suspend fun synchronize(service: RepositoryGitEngine, directory: File, message: String): SynchronizationResult =
-        withCredentials(false) { token, authenticated ->
-            val result = service.synchronizeSafely(directory, token, message)
-            if (authenticated && (result.finalState?.authenticationRejected == true ||
-                        result.uploadResult?.authenticationRejected == true)) access.reportAuthenticationRejected()
-            if (authenticated && result.finalState?.authenticationRequired == true &&
-                result.finalState.authenticationRejected.not())
-                result.copy(finalState = result.finalState.copy(repositoryAccessDenied = true)) else result
+    suspend fun synchronize(service: RepositoryGitEngine, directory: File, message: String,
+                            performance: SyncPerformanceRecorder? = null): SynchronizationResult =
+        performance.measureSuspending(SyncPhase.TOTAL) {
+            withCredentials(false, syncPerformance = performance) { token, authenticated ->
+                val result = if (performance == null) service.synchronizeSafely(directory, token, message)
+                    else service.synchronizeSafely(directory, token, message, performance)
+                if (authenticated && (result.finalState?.authenticationRejected == true ||
+                            result.uploadResult?.authenticationRejected == true)) access.reportAuthenticationRejected()
+                if (authenticated && result.finalState?.authenticationRequired == true &&
+                    result.finalState.authenticationRejected.not())
+                    result.copy(finalState = result.finalState.copy(repositoryAccessDenied = true)) else result
+            }
         }
 
     suspend fun migrate(manager: RepositoryMigrationManager, repositoryId: String,

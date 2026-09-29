@@ -51,6 +51,34 @@ class GitHubGitOperationsTest {
         assertFalse(report.toString().contains("oauth-test-value"))
     }
 
+    @Test fun measuredSyncIncludesOAuthAndLegacyEngineAndClearsCredentials() = runTest {
+        var now = 0L
+        val recorder = SyncPerformanceRecorder { now++ }
+        val engine = FakeEngine()
+        val provider = FakeProvider(GitHubConnectionState.Connected("user"), "oauth-test-value")
+        GitHubGitOperations(provider).synchronize(engine, directory, "change", recorder)
+        assertEquals(1, engine.synchronizeCalls)
+        assertTrue(engine.lastArray!!.all { it == '\u0000' })
+        assertEquals(listOf(SyncPhase.TOTAL, SyncPhase.OAUTH, SyncPhase.ENGINE), recorder.snapshot().timings.map { it.phase })
+        assertEquals(recorder.snapshot().totalNanos, recorder.snapshot().accountedNanos)
+        assertFalse(recorder.snapshot().toString().contains("oauth-test-value"))
+        assertNull(SyncPerformance.current())
+    }
+
+    @Test fun measuredSyncOAuthFailureHasPartialReportWithoutCallingEngine() = runTest {
+        val recorder = SyncPerformanceRecorder { 0 }
+        val engine = FakeEngine()
+        val provider = FakeProvider(GitHubConnectionState.Connected("user")).apply {
+            failureState = GitHubConnectionState.Error("private-test-error", retryable = true)
+        }
+        try {
+            GitHubGitOperations(provider).synchronize(engine, directory, "change", recorder)
+            fail("Expected authentication failure")
+        } catch (_: GitAccessUnavailableException) { assertEquals(0, engine.synchronizeCalls) }
+        assertEquals(listOf(SyncPhase.TOTAL, SyncPhase.OAUTH), recorder.snapshot().timings.map { it.phase })
+        assertFalse(recorder.snapshot().toString().contains("private-test-error"))
+    }
+
     @Test fun failedOAuthPullStillRecordsPartialDiagnosticWithoutCallingEngine() = runTest {
         val performance = PullPerformanceRecorder { 0 }
         val provider = FakeProvider(GitHubConnectionState.Connected("user")).apply {

@@ -900,6 +900,144 @@ class RepositorySynchronizationServiceTest {
         assertSynchronized(fixture, result)
     }
 
+    @Test fun deepProtectionAndStagingScaleWithRelevantPathsInsteadOfCleanRepositorySize() {
+        val reports = listOf(0, 320).map { cleanCount ->
+            val fixture = fixture((0 until cleanCount).associate { "clean/group/file-$it.bin" to "clean $it" })
+            File(fixture.local, "tracked.txt").writeText("local")
+            commitAndPush(fixture.writer, "remote.txt", "remote", "remote")
+            val recorder = SyncPerformanceRecorder()
+
+            val result = fixture.service.synchronizeSafely(fixture.local, "token".toCharArray(), "local", recorder)
+
+            assertEquals(result.message, SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED, result.outcome)
+            assertSynchronized(fixture, result)
+            assertNoMergeCommits(fixture.local)
+            val report = recorder.snapshot()
+            assertEquals(9L, report.counters[SyncCounter.WORKING_OBJECTS])
+            assertEquals(4L, report.counters[SyncCounter.FINGERPRINTS])
+            assertEquals(20L, report.counters[SyncCounter.SHA256_BYTES])
+            assertEquals(1L, report.counters[SyncCounter.STAGING_PATHS])
+            assertEquals(1L, report.counters[SyncCounter.STAGING_STREAMS])
+            assertEquals(0L, report.counters[SyncCounter.GLOBAL_ADD_CALLS])
+            assertEquals(1L, report.counters[SyncCounter.ADD_CALLS])
+            assertEquals(15L, report.counters[SyncCounter.STATUS_CALLS])
+            assertEquals(5L, report.counters[SyncCounter.FETCH_CALLS])
+            assertEquals(4L, report.counters[SyncCounter.CAPTURE_CALLS])
+            assertEquals(0, report.timings.count { it.phase == SyncPhase.ADD_UPDATE })
+            report
+        }
+        // Metadata remains global, but deep work is constant across both repository sizes.
+        assertTrue(requireNotNull(reports[1].counters[SyncCounter.INDEX_ENTRIES]) >
+            requireNotNull(reports[0].counters[SyncCounter.INDEX_ENTRIES]))
+        assertEquals(5L, reports[1].counters[SyncCounter.STAGING_STREAM_BYTES])
+    }
+
+    @Test fun tinyNewLocalAndRemoteFilesOnlyHashRelevantContentInALargeRepository() {
+        val fixture = fixture((0 until 320).associate { "clean/file-$it.txt" to "clean content $it" })
+        File(fixture.local, "tiny-local.txt").writeText("x")
+        commitAndPush(fixture.writer, "tiny-remote.txt", "y", "remote")
+        val recorder = SyncPerformanceRecorder()
+
+        val result = fixture.service.synchronizeSafely(fixture.local, "token".toCharArray(), "local", recorder)
+
+        assertEquals(result.message, SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED, result.outcome)
+        assertSynchronized(fixture, result)
+        val counters = recorder.snapshot().counters
+        assertEquals(2L, counters[SyncCounter.WORKING_OBJECTS])
+        assertEquals(4L, counters[SyncCounter.FINGERPRINTS])
+        assertEquals(4L, counters[SyncCounter.SHA256_FILES])
+        assertEquals(4L, counters[SyncCounter.SHA256_BYTES])
+        assertEquals(1L, counters[SyncCounter.ADD_CALLS])
+        assertEquals(1L, counters[SyncCounter.STAGING_PATHS])
+        assertEquals(0L, counters[SyncCounter.GLOBAL_ADD_CALLS])
+    }
+
+    @Test fun newRemoteScopeAfterRevalidationStillProtectsPreviouslyUnrelatedHiddenContent() {
+        // Class B introduced by a remote race: audit the recomputed diff before FF.
+        val fixture = fixture()
+        File(fixture.local, "local.txt").writeText("pending")
+        val timestamp = Instant.parse("2000-01-01T00:00:00Z")
+        Git.open(fixture.local).use { git ->
+            val cache = git.repository.lockDirCache()
+            try {
+                cache.getEntry("tracked.txt").setLastModified(timestamp)
+                cache.getEntry("tracked.txt").setLength(4)
+                cache.write()
+                assertTrue(cache.commit())
+            } finally { cache.unlock() }
+        }
+        File(fixture.local, "tracked.txt").writeText("mine")
+        Files.setLastModifiedTime(File(fixture.local, "tracked.txt").toPath(), FileTime.from(timestamp))
+        assertFalse(status(fixture.local).modified.contains("tracked.txt"))
+        commitAndPush(fixture.writer, "remote.txt", "remote", "remote")
+        val before = baseline(fixture)
+        fixture.gateway.beforeFetch = { count ->
+            if (count == 2) commitAndPush(fixture.writer, "tracked.txt", "remote tracked", "remote race")
+        }
+
+        val result = synchronize(fixture)
+
+        assertEquals(result.message, SynchronizationOutcome.ERROR, result.outcome)
+        assertLocalUnchanged(fixture, before)
+        assertEquals(0, fixture.gateway.pushCount)
+    }
+
+    @Test fun directedStagingHandlesMultipleSpecialNamesAndMixedChangesInDirectories() {
+        val modified = "folder with spaces/[draft] ñ.txt"
+        val deleted = "folder with spaces/delete #1.txt"
+        val added = "new folder/á new [2].txt"
+        val fixture = fixture(mapOf(modified to "original", deleted to "deleted"))
+        writeFile(fixture.local, modified, "modified")
+        assertTrue(File(fixture.local, deleted).delete())
+        writeFile(fixture.local, added, "new local")
+        commitAndPush(fixture.writer, "remote.txt", "remote", "remote")
+        commitAndPush(fixture.writer, "new-remote.txt", "new remote", "new remote")
+        val recorder = SyncPerformanceRecorder()
+
+        val result = fixture.service.synchronizeSafely(fixture.local, "token".toCharArray(), "local", recorder)
+
+        assertEquals(result.toString(), SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED, result.outcome)
+        assertSynchronized(fixture, result)
+        assertEquals(null, readBareFile(fixture.remote, deleted))
+        assertEquals("modified", readBareFile(fixture.remote, modified))
+        assertEquals("new local", readBareFile(fixture.remote, added))
+        assertEquals("new remote", readBareFile(fixture.remote, "new-remote.txt"))
+        assertEquals(2L, recorder.snapshot().counters[SyncCounter.STAGING_PATHS])
+        assertEquals(1L, recorder.snapshot().counters[SyncCounter.STAGING_DELETE_PATHS])
+        assertEquals(0L, recorder.snapshot().counters[SyncCounter.GLOBAL_ADD_CALLS])
+    }
+
+    @Test fun localTypeReplacementKeepsCheckoutBarrierAndStagesPermittedDirection() {
+        // Keep the preflight contract. A file replaced by a directory is blocked by
+        // JGit; the permitted opposite direction must preserve its staging semantics.
+        for (fileToDirectory in listOf(true, false)) {
+            val source = if (fileToDirectory) "node" else "node/child.txt"
+            val target = if (fileToDirectory) "node/child.txt" else "node"
+            val fixture = fixture(mapOf(source to "original"))
+            // This tests type replacement without JGit's known autocrlf tree-entry failure.
+            Git.open(fixture.local).use { git ->
+                git.repository.config.setBoolean("core", null, "autocrlf", false)
+                git.repository.config.save()
+            }
+            assertTrue(File(fixture.local, source).delete())
+            if (!fileToDirectory) assertTrue(File(fixture.local, source).parentFile!!.delete())
+            writeFile(fixture.local, target, "new local")
+            commitAndPush(fixture.writer, "remote.txt", "remote", "remote")
+            val before = baseline(fixture)
+
+            val result = synchronize(fixture)
+
+            if (fileToDirectory) {
+                assertEquals(result.message, SynchronizationOutcome.ERROR, result.outcome)
+                assertNoMutation(fixture, before)
+            } else {
+                assertCombinedSuccess(fixture, result, before.head, before.remoteHead)
+                assertEquals("new local", readBareFile(fixture.remote, target))
+                assertEquals(null, readBareFile(fixture.remote, source))
+            }
+        }
+    }
+
     private fun remoteAheadFixture(): Fixture = fixture().also {
         commitAndPush(it.writer, "remote.txt", "remote", "remote")
     }

@@ -97,25 +97,26 @@ class SynchronizationSafetyTest {
         assertEquals(0, fixture.gateway.pushCount)
     }
 
-    @Test fun hiddenLocalChangeBlocksEvenWhenRemoteIsDisjointInsteadOfReportingFalseUploadSuccess() {
+    @Test fun hiddenCleanUnrelatedFileTrustsGitWithoutBeingUploadedOrOverwritten() {
+        // Class C: no pending change reported by Git and no remote write on this path.
+        // The operation protects detected work; it does not promise a global physical audit.
         val fixture = fixture()
         hideTrackedModificationFromStatCache(fixture)
         File(fixture.local, "local.txt").writeText("otro cambio local")
         commitAndPush(fixture.writer, "remote.txt", "remoto disjunto")
-        val initialHead = head(fixture.local)
-        val remoteHead = head(fixture.writer)
-        val indexBytes = File(fixture.local, ".git/index").readBytes()
 
         val result = synchronize(fixture)
 
-        assertEquals(result.message, SynchronizationOutcome.ERROR, result.outcome)
-        assertEquals(initialHead, head(fixture.local))
-        assertEquals(remoteHead, bareHead(fixture.remote))
+        assertEquals(result.message, SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED, result.outcome)
+        assertEquals(head(fixture.local), bareHead(fixture.remote))
         assertEquals("mine", File(fixture.local, "tracked.txt").readText())
         assertEquals("otro cambio local", File(fixture.local, "local.txt").readText())
-        assertFalse(File(fixture.local, "remote.txt").exists())
-        assertTrue(indexBytes.contentEquals(File(fixture.local, ".git/index").readBytes()))
-        assertEquals(0, fixture.gateway.pushCount)
+        assertEquals("remoto disjunto", File(fixture.local, "remote.txt").readText())
+        Git.open(fixture.local).use { git ->
+            val entry = git.repository.readDirCache().getEntry("tracked.txt")
+            assertEquals("base", git.repository.open(entry.objectId).bytes.toString(Charsets.UTF_8))
+        }
+        assertEquals(1, fixture.gateway.pushCount)
     }
 
     @Test fun checkoutPreflightLeavesWorkingTreeAndIndexBytesUntouched() {
@@ -144,10 +145,13 @@ class SynchronizationSafetyTest {
         assertFalse(File(fixture.local, "remote.txt").exists())
     }
 
-    @Test fun contentGuardDetectsChangesEvenWhenFileSizeAndTimestampStayEqual() {
+    @Test fun relevantStagedContentGuardDetectsChangesEvenWhenFileSizeAndTimestampStayEqual() {
         val fixture = fixture()
         File(fixture.local, "local.txt").writeText("local")
+        // Class A: staged work makes this path relevant even when unstaged edits hide in stat.
         val tracked = File(fixture.local, "tracked.txt")
+        tracked.writeText("ours")
+        Git.open(fixture.local).use { it.add().addFilepattern("tracked.txt").call() }
         val timestamp = Instant.parse("2000-01-01T00:00:00Z")
         Git.open(fixture.local).use { git ->
             val cache = git.repository.lockDirCache()
@@ -209,6 +213,54 @@ class SynchronizationSafetyTest {
         Git.open(fixture.local).use { assertTrue(it.status().call().isClean) }
     }
 
+    @Test fun instrumentedDisjointFlowKeepsAllOperationsAndCountsActualShaStreamBytes() {
+        val fixture = fixture()
+        File(fixture.local, "local.txt").writeText("local")
+        val exclude = File(fixture.local, ".git/info/exclude")
+        requireNotNull(exclude.parentFile).mkdirs()
+        exclude.appendText("\nprivate-ignored/\n")
+        val ignored = File(fixture.local, "private-ignored/private.bin")
+        requireNotNull(ignored.parentFile).mkdirs()
+        ignored.writeBytes(ByteArray(13) { 42 })
+        commitAndPush(fixture.writer, "remote.txt", "remote")
+        val token = "private-token-value".toCharArray()
+        val recorder = SyncPerformanceRecorder()
+
+        val result = fixture.service.synchronizeSafely(fixture.local, token, "Trabajo local", recorder)
+
+        assertEquals(result.message, SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED, result.outcome)
+        assertEquals(head(fixture.local), bareHead(fixture.remote))
+        assertEquals("local", File(fixture.local, "local.txt").readText())
+        assertEquals("remote", File(fixture.local, "remote.txt").readText())
+        assertTrue(ByteArray(13) { 42 }.contentEquals(ignored.readBytes()))
+        assertTrue(token.all { it == '\u0000' })
+        assertEquals(1, fixture.gateway.pushCount)
+        val report = recorder.snapshot()
+        assertEquals(15L, report.counters[SyncCounter.STATUS_CALLS])
+        assertEquals(5L, report.counters[SyncCounter.FETCH_CALLS])
+        assertEquals(4L, report.counters[SyncCounter.CAPTURE_CALLS])
+        assertEquals(9L, report.counters[SyncCounter.INDEX_READS])
+        assertEquals(25L, report.counters[SyncCounter.REV_WALK_CALLS])
+        assertEquals(7L, report.counters[SyncCounter.RELATION_CALLS])
+        assertEquals(2L, report.counters[SyncCounter.PREFLIGHT_CALLS])
+        assertEquals(1L, report.counters[SyncCounter.ADD_CALLS])
+        assertEquals(1L, report.counters[SyncCounter.COMMIT_CALLS])
+        assertEquals(1L, report.counters[SyncCounter.PUSH_CALLS])
+        assertEquals(4L, report.counters[SyncCounter.SHA256_FILES])
+        assertEquals(20L, report.counters[SyncCounter.SHA256_BYTES])
+        assertEquals(2L, report.counters[SyncCounter.WORKING_OBJECTS])
+        assertEquals(4L, report.counters[SyncCounter.FINGERPRINTS])
+        assertEquals(1L, report.counters[SyncCounter.STAGING_PATHS])
+        assertEquals(0L, report.counters[SyncCounter.GLOBAL_ADD_CALLS])
+        assertEquals(listOf(5L, 5L, 5L, 5L), report.timings.filter { it.phase == SyncPhase.CAPTURE }
+            .map { it.counters[SyncCounter.SHA256_BYTES] })
+        assertEquals(5, report.timings.count { it.phase == SyncPhase.FETCH })
+        assertEquals(4, report.timings.count { it.phase == SyncPhase.CAPTURE })
+        val rendered = report.toString() + syncPerformanceLines(report)
+        listOf("private-token-value", fixture.local.absolutePath, "private.bin", "remote.txt", "local.txt")
+            .forEach { assertFalse(rendered.contains(it)) }
+    }
+
     private fun fixture(attributes: String? = null): Fixture {
         val root = temporaryFolder.newFolder()
         val remote = File(root, "remote.git")
@@ -237,7 +289,7 @@ class SynchronizationSafetyTest {
     }
 
     private fun synchronize(fixture: Fixture) = fixture.service.synchronizeSafely(
-        fixture.local, "token-local".toCharArray(), "Trabajo local")
+        fixture.local, "token-local".toCharArray(), "Trabajo local", SyncPerformanceRecorder())
 
     private fun hideTrackedModificationFromStatCache(fixture: Fixture) {
         val timestamp = Instant.parse("2000-01-01T00:00:00Z")

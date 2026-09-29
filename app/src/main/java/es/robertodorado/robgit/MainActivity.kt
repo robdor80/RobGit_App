@@ -1,6 +1,8 @@
 package es.robertodorado.robgit
 
 import android.content.pm.ActivityInfo
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
@@ -125,6 +127,7 @@ private fun RobGitScreen(
     var repositoryState by remember { mutableStateOf<RepositoryStateSnapshot?>(null) }
     var lastOperation by remember { mutableStateOf<RestoredOperation?>(null) }
     val pullPerformanceByRepository by PullPerformanceStore.process.reports.collectAsState()
+    val syncPerformanceByRepository by SyncPerformanceStore.process.reports.collectAsState()
     var noticeTitle by remember { mutableStateOf<String?>(null) }
     var noticeBody by remember { mutableStateOf<String?>(null) }
     var noticeRecommendation by remember { mutableStateOf<String?>(null) }
@@ -490,11 +493,13 @@ private fun RobGitScreen(
     fun synchronize(commitMessage: String = "Cambios desde RobGit") {
         val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
+        val repositoryId = selectedRepository?.id ?: return
         if (runningOperation != null) return
         runningOperation = "SINCRONIZAR"; clearNotice()
         scope.launch {
+            val performance = SyncPerformanceRecorder()
             try {
-                val result = withContext(Dispatchers.IO) { gitOperations.synchronize(service, directory, commitMessage) }
+                val result = withContext(Dispatchers.IO) { gitOperations.synchronize(service, directory, commitMessage, performance) }
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("SINCRONIZAR", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
@@ -503,7 +508,10 @@ private fun RobGitScreen(
                 ) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
             } catch (failure: GitAccessUnavailableException) {
                 setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
-            } finally { runningOperation = null }
+            } finally {
+                SyncPerformanceStore.process.record(repositoryId, performance.snapshot())
+                runningOperation = null
+            }
         }
     }
 
@@ -617,7 +625,8 @@ private fun RobGitScreen(
         }
     }
     if (showTechnical) TechnicalDetailsDialog(selectedRepository, technicalDirectory, backupDirectory, repositoryState,
-        lastOperation, pullPerformanceByRepository[selectedRepository?.id]) { showTechnical = false }
+        lastOperation, pullPerformanceByRepository[selectedRepository?.id],
+        syncPerformanceByRepository[selectedRepository?.id]) { showTechnical = false }
     if (showAi) AiAssistantDialog(
         context = aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,
             lastOperation?.let { AiLastOperation(it.operation, it.outcome, it.message, it.detail) }),
@@ -973,9 +982,21 @@ private fun AddRepositoryDialog(
 
 @Composable
 private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, backupDirectory: File?, state: RepositoryStateSnapshot?,
-                                   operation: RestoredOperation?, pullPerformance: PullPerformanceReport?, onDismiss: () -> Unit) {
+                                   operation: RestoredOperation?, pullPerformance: PullPerformanceReport?,
+                                   syncPerformance: SyncPerformanceReport?, onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    val syncLines = remember(syncPerformance) { syncPerformanceLines(syncPerformance) }
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Detalles técnicos") }, text = {
         Column(Modifier.heightIn(max = 520.dp).verticalScroll(rememberScrollState()).padding(bottom = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("RENDIMIENTO ÚLTIMA SINCRONIZACIÓN", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
+            if (syncPerformance?.timings?.isNotEmpty() == true) {
+                TextButton(onClick = {
+                    context.getSystemService(ClipboardManager::class.java).setPrimaryClip(
+                        ClipData.newPlainText("RobGitSyncPerformance", syncLines.joinToString("\n")))
+                }) { Text("COPIAR INFORME DE SINCRONIZACIÓN") }
+            }
+            syncLines.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+            HorizontalDivider()
             Text("RENDIMIENTO ÚLTIMO PULL", color = RobGitColors.IceMuted, fontWeight = FontWeight.Bold)
             pullPerformanceLines(pullPerformance).forEach { Text(it) }
             if (pullPerformance?.timings?.isNotEmpty() == true) {
