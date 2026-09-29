@@ -51,7 +51,7 @@ object RepositoryStatusPresenter {
             return RepositoryHumanStatus(
                 "Hay conflictos pendientes.",
                 "RobGit ha bloqueado las operaciones automáticas para proteger tus archivos.",
-                "Puedes pedir a la IA que te lo explique.",
+                "Puedes pedir a Rodo que te lo explique.",
                 RepositoryAction.AI,
                 blocked = true,
             )
@@ -194,7 +194,7 @@ object RepositoryStatusPresenter {
         DownloadOutcome.BLOCKED_LOCAL_CHANGES -> RepositoryHumanStatus(
             "Tienes trabajo local pendiente.",
             "RobGit no descargará cambios mientras haya trabajo sin guardar en GitHub.",
-            "Puedes pedir a la IA que te lo explique.", RepositoryAction.AI, blocked = true,
+            "Puedes pedir a Rodo que te lo explique.", RepositoryAction.AI, blocked = true,
         )
         DownloadOutcome.BLOCKED_LOCAL_COMMITS -> RepositoryHumanStatus(
             "Tienes cambios pendientes de subir.",
@@ -285,7 +285,7 @@ object RepositoryStatusPresenter {
             SynchronizationOutcome.BLOCKED_OVERLAPPING_FILES -> RepositoryHumanStatus(
                 "Hay cambios incompatibles en ambos sitios.",
                 "Los mismos archivos han cambiado en este dispositivo y en GitHub, o sus rutas pueden colisionar. RobGit no ha realizado ningún cambio.",
-                "Puedes resolverlo manualmente o pedir a la IA que te lo explique.",
+                "Puedes resolverlo manualmente o pedir a Rodo que te lo explique.",
                 RepositoryAction.AI, blocked = true,
             )
             SynchronizationOutcome.BLOCKED_CHANGES_ON_BOTH_SIDES,
@@ -327,7 +327,7 @@ object RepositoryStatusPresenter {
         val recommendation = when {
             result.outcome == SynchronizationOutcome.AUTH_REQUIRED ||
                 result.outcome == SynchronizationOutcome.AUTH_FAILED -> "Conecta RobGit con GitHub desde Ajustes para continuar."
-            needsAi -> "Puedes pedir a la IA que te explique el bloqueo."
+            needsAi -> "Puedes pedir a Rodo que te explique el bloqueo."
             else -> "Analiza nuevamente el repositorio para comprobar el estado antes de continuar."
         }
         return RepositoryHumanStatus(
@@ -362,7 +362,7 @@ object RepositoryStatusPresenter {
     private fun conflicts() = RepositoryHumanStatus(
         "Hay conflictos pendientes.",
         "RobGit ha bloqueado las operaciones automáticas para proteger tus archivos.",
-        "Puedes pedir a la IA que te lo explique.", RepositoryAction.AI, blocked = true,
+        "Puedes pedir a Rodo que te lo explique.", RepositoryAction.AI, blocked = true,
     )
 }
 

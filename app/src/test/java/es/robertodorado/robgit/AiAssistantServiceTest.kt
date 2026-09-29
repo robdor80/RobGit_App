@@ -41,7 +41,7 @@ class AiAssistantServiceTest {
     @Test fun emptyCustomQuestionIsBlockedBeforeProvider() = runTest {
         val provider = RecordingProvider()
         val result = AiAssistantService(provider).execute(AiTask.CUSTOM_QUESTION, AiTestFixtures.context(), "  ")
-        assertEquals(AiAssistantResult.Unavailable("Escribe una pregunta para el asistente."), result)
+        assertEquals(AiAssistantResult.Unavailable("Escribe una pregunta para Rodo."), result)
         assertTrue(provider.requests.isEmpty())
     }
 

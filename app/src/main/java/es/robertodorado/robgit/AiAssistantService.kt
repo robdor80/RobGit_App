@@ -13,7 +13,7 @@ internal class AiAssistantService(
         }
         val safeQuestion = filter.sanitizeText(question, AiContextFilter.MAX_QUESTION)
         if (task == AiTask.CUSTOM_QUESTION && safeQuestion == null) {
-            return AiAssistantResult.Unavailable("Escribe una pregunta para el asistente.")
+            return AiAssistantResult.Unavailable("Escribe una pregunta para Rodo.")
         }
         val request = AiRequest(task, filter.filter(context), safeQuestion)
         return try {
@@ -22,7 +22,7 @@ internal class AiAssistantService(
             throw failure
         } catch (_: Exception) {
             // Provider exception messages may contain private input or credentials.
-            AiAssistantResult.Failed("No se pudo obtener una respuesta del asistente. Puedes intentarlo de nuevo.")
+            AiAssistantResult.Failed("No se pudo obtener una respuesta de Rodo. Puedes intentarlo de nuevo.")
         }
     }
 

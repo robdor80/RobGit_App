@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.os.Environment
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.viewModels
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -31,6 +32,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -56,6 +58,7 @@ import java.io.File
 import java.util.UUID
 
 class MainActivity : ComponentActivity() {
+    private val rodoModel: RodoViewModel by viewModels()
     private val foregroundPolicy = ForegroundRefreshPolicy()
     private var foregroundReturn by mutableIntStateOf(0)
     private var authCallback by mutableStateOf<String?>(null)
@@ -80,6 +83,7 @@ class MainActivity : ComponentActivity() {
                 RobGitScreen(
                     diagnosticRoot, remember { GitRepositoryService() }, registry, workspaceResolver,
                     migrationManager, foregroundReturn, authService, authCallback, { authCallback = null },
+                    rodoModel.session,
                 )
             }
         }
@@ -116,6 +120,7 @@ private fun RobGitScreen(
     authService: GitHubAuthService,
     authCallback: String?,
     onAuthCallbackConsumed: () -> Unit,
+    rodoSession: RodoSession,
 ) {
     var catalog by remember { mutableStateOf<RepositoryCatalog?>(null) }
     var uiRepositoryId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -176,7 +181,10 @@ private fun RobGitScreen(
     val githubState by authService.state.collectAsState()
     val gitOperations = remember(authService) { GitHubGitOperations(authService) }
     val aiContextBuilder = remember { AiContextBuilder() }
-    val aiAssistantService = remember { AiAssistantService(FirebaseGeminiAiProvider()) }
+    val rodoState by rodoSession.state.collectAsState()
+    LaunchedEffect(selectedRepository?.id, catalog != null) {
+        if (catalog != null) rodoSession.selectRepository(selectedRepository?.id)
+    }
 
     val refreshLocalNow by rememberUpdatedState<suspend (RepositoryWatchTarget) -> RepositoryStateSnapshot>({ target ->
         val config = requireNotNull(selectedRepository)
@@ -318,6 +326,8 @@ private fun RobGitScreen(
             migrationJournalError = "El registro de una migración está dañado. RobGit ha bloqueado las operaciones para proteger tus repositorios."
         }
         if (repositorySelectionNeedsReset(uiRepositoryId, loaded.selectedRepositoryId)) {
+            rodoSession.reset()
+            showAi = false
             repositoryPrepared = null
             repositoryState = null
             lastOperation = null
@@ -348,6 +358,8 @@ private fun RobGitScreen(
         }
     }
     fun clearRepositoryUi() {
+        rodoSession.reset()
+        showAi = false
         autoRefresh.select(null)
         repositoryPrepared = null
         repositoryState = null
@@ -638,10 +650,46 @@ private fun RobGitScreen(
 
     Surface(color = RobGitColors.Petroleum, modifier = Modifier.fillMaxSize()) {
         BoxWithConstraints(Modifier.fillMaxSize()) {
-            val tablet = LocalConfiguration.current.smallestScreenWidthDp >= 600
-            val landscapeTablet = tablet && maxWidth > maxHeight
+            val layoutMode = robGitLayoutMode(LocalConfiguration.current.smallestScreenWidthDp,
+                maxWidth.value, maxHeight.value)
+            val tablet = layoutMode != RobGitLayoutMode.PHONE
+            val landscapeTablet = layoutMode == RobGitLayoutMode.TABLET_LANDSCAPE
             val outerPadding = if (tablet) RobGitDimens.TabletPadding else RobGitDimens.PhonePadding
-            Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(outerPadding), horizontalAlignment = Alignment.CenterHorizontally) {
+            if (layoutMode == RobGitLayoutMode.TABLET_PORTRAIT) {
+                val compactHeight = portraitNeedsScrollableFallback(maxHeight.value)
+                Box(Modifier.fillMaxSize().navigationBarsPadding().padding(bottom = 18.dp)
+                    .padding(outerPadding), contentAlignment = Alignment.TopCenter) {
+                    Column(Modifier.widthIn(max = 760.dp).fillMaxSize()) {
+                        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth().clipToBounds()) {
+                            val cardMaxHeight = rodoCardMaxHeight(maxHeight.value).dp
+                            Column(Modifier.fillMaxSize().then(if (compactHeight)
+                                Modifier.verticalScroll(rememberScrollState()) else Modifier)) {
+                                RobGitHeader({ analyze() }, { showTechnical = true }, { showSettings = true })
+                                Spacer(Modifier.height(18.dp))
+                                RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository,
+                                    { showAddRepository = true })
+                                Spacer(Modifier.height(22.dp))
+                                HumanStatusPanel(displayedStatus, runningOperation != null,
+                                    repositoryPrepared == false && supportActionLabel == null &&
+                                        workspaceResolutionError == null && migrationJournalError == null,
+                                    selectedRepository == null && catalog != null,
+                                    { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
+                                Spacer(Modifier.height(34.dp))
+                                RodoPanel(rodoState, Modifier.fillMaxWidth().heightIn(max = cardMaxHeight)
+                                    .then(if (compactHeight) Modifier else Modifier.weight(1f, fill = false)))
+                            }
+                        }
+                        Spacer(Modifier.height(18.dp))
+                        TabletPortraitActionRow(baseStatus,
+                            functionalRepository != null && repositoryPrepared == true && runningOperation == null,
+                            { pull() }, ::requestPushCommitMessage,
+                            { if (baseStatus.recommendedAction == RepositoryAction.PUSH ||
+                                baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE)
+                                commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
+                            { showAi = true }, rodoState is RodoState.Thinking)
+                    }
+                }
+            } else Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(outerPadding), horizontalAlignment = Alignment.CenterHorizontally) {
                 Column(Modifier.fillMaxWidth().widthIn(max = RobGitDimens.ContentMax)) {
                     RobGitHeader({ analyze() }, { showTechnical = true }, { showSettings = true })
                     Spacer(Modifier.height(18.dp))
@@ -654,7 +702,7 @@ private fun RobGitScreen(
                             ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
                                 ::requestPushCommitMessage,
                                 { if (baseStatus.recommendedAction == RepositoryAction.PUSH || baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
-                                { showAi = true }, Modifier.weight(.85f))
+                                { showAi = true }, Modifier.weight(.85f), rodoState is RodoState.Thinking)
                         }
                     } else {
                         RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
@@ -663,10 +711,24 @@ private fun RobGitScreen(
                         ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
                             ::requestPushCommitMessage,
                             { if (baseStatus.recommendedAction == RepositoryAction.PUSH || baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
-                            { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp))
+                            { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp),
+                            rodoState is RodoState.Thinking)
                     }
                 }
             }
+            if (showAi) AiAssistantDialog(
+                context = aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,
+                    lastOperation?.let { AiLastOperation(it.operation, it.outcome, it.message, it.detail) }),
+                state = rodoState,
+                showResultInDialog = layoutMode != RobGitLayoutMode.TABLET_PORTRAIT,
+                onSubmit = { task, question ->
+                    rodoSession.submit(task,
+                        aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,
+                            lastOperation?.let { AiLastOperation(it.operation, it.outcome, it.message, it.detail) }),
+                        question)
+                },
+                onDismiss = { showAi = false },
+            )
         }
     }
 
@@ -695,12 +757,6 @@ private fun RobGitScreen(
     if (showTechnical) TechnicalDetailsDialog(selectedRepository, technicalDirectory, backupDirectory, repositoryState,
         lastOperation, pullPerformanceByRepository[selectedRepository?.id],
         syncPerformanceByRepository[selectedRepository?.id]) { showTechnical = false }
-    if (showAi) AiAssistantDialog(
-        context = aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,
-            lastOperation?.let { AiLastOperation(it.operation, it.outcome, it.message, it.detail) }),
-        service = aiAssistantService,
-        onDismiss = { showAi = false },
-    )
     if (showAddRepository) AddRepositoryDialog(
         error = addError,
         busy = runningOperation != null,
@@ -902,10 +958,12 @@ private fun HumanStatusPanel(status: RepositoryHumanStatus, running: Boolean, no
 
 /** Rounded frame whose top stroke is drawn in two pieces around its integrated title. */
 @Composable
-private fun TitledFrame(
+internal fun TitledFrame(
     title: String,
     modifier: Modifier = Modifier,
     contentColor: Color? = null,
+    titleIcon: (@Composable () -> Unit)? = null,
+    fillContent: Boolean = false,
     content: @Composable () -> Unit,
 ) {
     val titleStyle = MaterialTheme.typography.labelLarge
@@ -918,6 +976,7 @@ private fun TitledFrame(
     Box(modifier.padding(top = 10.dp)) {
         Column(
             Modifier.fillMaxWidth()
+                .then(if (fillContent) Modifier.fillMaxHeight() else Modifier)
                 .padding(top = 22.dp)
                 .then(if (contentColor != null) Modifier.background(contentColor, shape) else Modifier),
         ) {
@@ -929,7 +988,8 @@ private fun TitledFrame(
             val inset = stroke / 2f
             val top = titleLayout.size.height / 2f
             val gapStart = titleStart.toPx() - 8.dp.toPx()
-            val gapEnd = titleStart.toPx() + titleLayout.size.width + 8.dp.toPx()
+            val gapEnd = titleStart.toPx() + titleLayout.size.width +
+                (if (titleIcon != null) 29.dp.toPx() else 0f) + 8.dp.toPx()
             val width = size.width
             val height = size.height
             val path = Path().apply {
@@ -947,22 +1007,22 @@ private fun TitledFrame(
             }
             drawPath(path, RobGitColors.Ice, style = Stroke(width = stroke))
         }
-        Text(
-            title,
-            style = titleStyle,
-            fontWeight = FontWeight.Bold,
-            color = RobGitColors.Ice,
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier.align(Alignment.TopStart).padding(start = titleStart),
-        )
+        ) {
+            titleIcon?.let { icon -> icon(); Spacer(Modifier.width(6.dp)) }
+            Text(title, style = titleStyle, fontWeight = FontWeight.Bold, color = RobGitColors.Ice)
+        }
     }
 }
 
 @Composable
-private fun ActionGrid(status: RepositoryHumanStatus, enabled: Boolean, onPull: () -> Unit, onPush: () -> Unit, onSync: () -> Unit, onAi: () -> Unit, modifier: Modifier = Modifier) {
+private fun ActionGrid(status: RepositoryHumanStatus, enabled: Boolean, onPull: () -> Unit, onPush: () -> Unit, onSync: () -> Unit, onAi: () -> Unit, modifier: Modifier = Modifier, rodoThinking: Boolean = false) {
     val pullVisual = actionButtonVisualState(status, enabled, RepositoryAction.PULL)
     val pushVisual = actionButtonVisualState(status, enabled, RepositoryAction.PUSH)
     val syncVisual = actionButtonVisualState(status, enabled, RepositoryAction.SYNCHRONIZE)
-    val aiVisual = actionButtonVisualState(status, enabled, RepositoryAction.AI)
+    val aiVisual = actionButtonVisualState(status, enabled && !rodoThinking, RepositoryAction.AI)
     Column(modifier, verticalArrangement = Arrangement.spacedBy(14.dp)) {
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
             RobGitActionButton("↓", "PULL", pullVisual, onPull, Modifier.weight(1f))
@@ -970,7 +1030,30 @@ private fun ActionGrid(status: RepositoryHumanStatus, enabled: Boolean, onPull: 
         }
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp), modifier = Modifier.fillMaxWidth()) {
             RobGitActionButton("↕", "SINCRONIZAR", syncVisual, onSync, Modifier.weight(1f))
-            RobGitActionButton("✦", "IA", aiVisual, onAi, Modifier.weight(1f), RobGitColors.Ai)
+            RobGitActionButton(aiActionIdentity.icon, aiActionIdentity.label, aiVisual, onAi,
+                Modifier.weight(1f), RobGitColors.Ai)
+        }
+    }
+}
+
+@Composable
+private fun TabletPortraitActionRow(status: RepositoryHumanStatus, enabled: Boolean,
+                                    onPull: () -> Unit, onPush: () -> Unit, onSync: () -> Unit,
+                                    onRodo: () -> Unit, rodoThinking: Boolean) {
+    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(14.dp)) {
+        tabletPortraitActions.forEach { identity ->
+            val onClick = when (identity.action) {
+                RepositoryAction.PULL -> onPull
+                RepositoryAction.PUSH -> onPush
+                RepositoryAction.SYNCHRONIZE -> onSync
+                RepositoryAction.AI -> onRodo
+            }
+            RobGitActionButton(identity.icon, identity.label,
+                actionButtonVisualState(status, enabled && !(rodoThinking && identity.action == RepositoryAction.AI),
+                    identity.action),
+                onClick, Modifier.weight(1f),
+                if (identity.action == RepositoryAction.AI) RobGitColors.Ai else RobGitColors.Ice,
+                compact = true)
         }
     }
 }
@@ -1003,11 +1086,23 @@ internal fun actionButtonVisualState(
 }
 
 @Composable
-private fun RobGitActionButton(icon: String, label: String, visual: ActionButtonVisualState, onClick: () -> Unit, modifier: Modifier, iconColor: Color = RobGitColors.Ice) {
+private fun RobGitActionButton(icon: String, label: String, visual: ActionButtonVisualState, onClick: () -> Unit, modifier: Modifier, iconColor: Color = RobGitColors.Ice, compact: Boolean = false) {
     val interaction = remember { MutableInteractionSource() }; val pressed by interaction.collectIsPressedAsState()
     val elevation by animateDpAsState(if (pressed) 1.dp else 5.dp, label = "relieve"); val shape = RoundedCornerShape(RobGitDimens.Radius)
-    Box(contentAlignment = Alignment.Center, modifier = modifier.widthIn(max = RobGitDimens.ButtonMax).aspectRatio(1f).shadow(elevation, shape, ambientColor = RobGitColors.PetroleumDeep, spotColor = RobGitColors.PetroleumDeep).background(RobGitColors.PetroleumDark, shape).clickable(interactionSource = interaction, indication = null, enabled = visual.enabled, role = Role.Button, onClick = onClick).semantics { contentDescription = label }) {
-        Column(Modifier.alpha(visual.contentAlpha), horizontalAlignment = Alignment.CenterHorizontally) { Text(icon, fontSize = 42.sp, color = iconColor, lineHeight = 44.sp); Spacer(Modifier.height(7.dp)); Text(label, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center) }
+    Box(contentAlignment = Alignment.Center, modifier = modifier
+        .then(if (compact) Modifier else Modifier.widthIn(max = RobGitDimens.ButtonMax))
+        .aspectRatio(1f).shadow(elevation, shape, ambientColor = RobGitColors.PetroleumDeep,
+            spotColor = RobGitColors.PetroleumDeep).background(RobGitColors.PetroleumDark, shape)
+        .clickable(interactionSource = interaction, indication = null, enabled = visual.enabled,
+            role = Role.Button, onClick = onClick).semantics { contentDescription = label }) {
+        Column(Modifier.alpha(visual.contentAlpha), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(icon, fontSize = if (compact) 34.sp else 42.sp, color = iconColor,
+                lineHeight = if (compact) 36.sp else 44.sp)
+            Spacer(Modifier.height(if (compact) 5.dp else 7.dp))
+            if (compact) Text(label, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
+                fontSize = 12.sp, maxLines = 1)
+            else Text(label, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        }
         Box(Modifier.matchParentSize().border(visual.borderWidth, (if (visual.recommended) Color.White else RobGitColors.Ice).copy(alpha = visual.borderAlpha), shape))
     }
 }
