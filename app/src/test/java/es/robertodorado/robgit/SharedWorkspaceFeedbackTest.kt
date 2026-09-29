@@ -32,6 +32,8 @@ class SharedWorkspaceFeedbackTest {
         assertEquals("PUSH completado correctamente", feedback("PUSH DE PRUEBA", UploadOutcome.SUCCESS.name).title)
         assertEquals("Sincronización completada: cambios descargados",
             feedback("SINCRONIZAR WORKSPACE", SynchronizationOutcome.SUCCESS_DOWNLOADED.name).title)
+        assertEquals("Sincronización completada: cambios descargados y subidos",
+            feedback("SINCRONIZAR WORKSPACE", SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED.name).title)
     }
 
     @Test fun blockedOperationsKeepTheHumanErrorFromTheGitService() {

@@ -88,6 +88,36 @@ class SharedWorkspaceProbeTest {
         assertEquals(head, Git.open(probe.repositoryDirectory).use { it.repository.resolve("HEAD")!!.name })
     }
 
+    @Test fun synchronizationWithDisjointLocalAndRemoteChangesReportsCombinedSuccess() {
+        val remote = createRemote("combined-sync")
+        val probe = probe(File(folder.root, "Documents"), remote = remote)
+        assertTrue(probe.prepare().success)
+        File(probe.repositoryDirectory, "local.md").writeText("local work")
+
+        val writer = File(remote.parentFile, "writer")
+        Git.open(writer).use { git ->
+            File(writer, "README.md").writeText("remote work")
+            git.add().addFilepattern("README.md").call()
+            git.commit().setMessage("remote change").setAuthor("Test", "test@localhost")
+                .setCommitter("Test", "test@localhost").call()
+            git.push().setRemote("origin").call()
+        }
+
+        val result = probe.synchronize("local-test-token".toCharArray(), "Guardar trabajo local")
+        assertTrue(result.message, result.success)
+        assertEquals(SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED.name, result.outcome)
+        assertEquals(CommitRelation.SYNCHRONIZED, result.state?.relation)
+        assertEquals(false, result.state?.changes?.hasChanges)
+        assertEquals("local work", File(probe.repositoryDirectory, "local.md").readText())
+        assertEquals("remote work", File(probe.repositoryDirectory, "README.md").readText())
+        Git.open(probe.repositoryDirectory).use { git ->
+            assertTrue(git.status().call().isClean)
+            Git.open(remote).use { remoteGit ->
+                assertEquals(remoteGit.repository.resolve("refs/heads/main"), git.repository.resolve("HEAD"))
+            }
+        }
+    }
+
     @Test fun wrongConfiguredBranchBlocksExistingRepositoryAndMissingBranchDoesNotCreateTarget() {
         val docs = File(folder.root, "Documents")
         val remote = createRemote("branch")

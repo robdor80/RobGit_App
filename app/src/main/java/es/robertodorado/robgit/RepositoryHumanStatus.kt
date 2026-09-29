@@ -77,9 +77,8 @@ object RepositoryStatusPresenter {
             return RepositoryHumanStatus(
                 "Hay cambios en los dos sitios.",
                 "Este dispositivo contiene cambios locales y GitHub también tiene cambios nuevos.",
-                "No es seguro aplicar una operación automática. RobGit no ha modificado nada.",
-                RepositoryAction.AI,
-                blocked = true,
+                "Puedes SINCRONIZAR: RobGit comprobará si afectan a archivos diferentes antes de continuar.",
+                RepositoryAction.SYNCHRONIZE,
             )
         }
         if (state.changes.hasChanges) {
@@ -189,59 +188,139 @@ object RepositoryStatusPresenter {
         DownloadOutcome.ERROR -> genericError()
     }
 
-    fun present(result: UploadResult): RepositoryHumanStatus = when (result.outcome) {
-        UploadOutcome.SUCCESS -> RepositoryHumanStatus(
-            "PUSH completado.", "Tus cambios ya están guardados en GitHub.",
-        )
-        UploadOutcome.NOTHING_TO_UPLOAD -> RepositoryHumanStatus(
-            "Todo está al día.", "No había cambios pendientes de subir.",
-        )
-        UploadOutcome.AUTH_REQUIRED -> authRequired()
-        UploadOutcome.AUTH_FAILED -> if (result.authenticationRejected) authFailed() else repositoryAccessDenied()
-        UploadOutcome.PUSH_UNCERTAIN -> pushUncertain()
-        UploadOutcome.BLOCKED_CONFLICTS -> conflicts()
-        UploadOutcome.BLOCKED_DIVERGED -> diverged()
-        UploadOutcome.FETCH_ERROR -> fetchError()
-        UploadOutcome.BLOCKED_REMOTE_AHEAD,
-        UploadOutcome.PUSH_REJECTED_REMOTE_CHANGED,
-        -> RepositoryHumanStatus(
-            "GitHub tiene cambios nuevos.",
-            "La subida se ha detenido porque las dos copias ya no coinciden.",
-            "RobGit no ha modificado nada para proteger tu trabajo.", blocked = true,
-        )
-        UploadOutcome.ERROR -> genericError()
+    fun present(result: UploadResult): RepositoryHumanStatus {
+        if (result.commitCreated && (result.outcome == UploadOutcome.FETCH_ERROR ||
+                result.outcome == UploadOutcome.PUSH_REJECTED_REMOTE_CHANGED ||
+                result.outcome == UploadOutcome.BLOCKED_REMOTE_AHEAD)) {
+            return uploadStoppedAfterCommit(result)
+        }
+        return when (result.outcome) {
+            UploadOutcome.SUCCESS -> RepositoryHumanStatus(
+                "PUSH completado.", "Tus cambios ya están guardados en GitHub.",
+            )
+            UploadOutcome.NOTHING_TO_UPLOAD -> RepositoryHumanStatus(
+                "Todo está al día.", "No había cambios pendientes de subir.",
+            )
+            UploadOutcome.AUTH_REQUIRED -> authRequired()
+            UploadOutcome.AUTH_FAILED -> if (result.authenticationRejected) authFailed() else repositoryAccessDenied()
+            UploadOutcome.PUSH_UNCERTAIN -> pushUncertain()
+            UploadOutcome.BLOCKED_CONFLICTS -> conflicts()
+            UploadOutcome.BLOCKED_DIVERGED -> diverged()
+            UploadOutcome.FETCH_ERROR -> fetchError()
+            UploadOutcome.BLOCKED_REMOTE_AHEAD,
+            UploadOutcome.PUSH_REJECTED_REMOTE_CHANGED,
+            -> RepositoryHumanStatus(
+                "GitHub tiene cambios nuevos.",
+                "La subida se ha detenido porque las dos copias ya no coinciden.",
+                "RobGit no ha modificado nada para proteger tu trabajo.", blocked = true,
+            )
+            UploadOutcome.ERROR -> genericError()
+        }
     }
 
-    fun present(result: SynchronizationResult): RepositoryHumanStatus = when (result.outcome) {
-        SynchronizationOutcome.SUCCESS_DOWNLOADED,
-        SynchronizationOutcome.SUCCESS_UPLOADED,
-        -> RepositoryHumanStatus(
-            "Sincronización completada.",
-            "Este dispositivo y GitHub vuelven a estar coordinados.",
-        )
-        SynchronizationOutcome.NOTHING_TO_DO -> RepositoryHumanStatus(
-            "Todo está al día.", "No era necesario hacer nada.",
-        )
-        SynchronizationOutcome.AUTH_REQUIRED -> if (result.finalState?.repositoryAccessDenied == true)
-            repositoryAccessDenied() else if (result.finalState?.authenticationRejected == true)
-            authFailed() else if (result.finalState?.authenticationRequired == true)
-            authorizationForReading() else authRequired()
-        SynchronizationOutcome.AUTH_FAILED -> if (result.uploadResult?.authenticationRejected == true)
-            authFailed() else repositoryAccessDenied()
-        SynchronizationOutcome.PUSH_UNCERTAIN -> pushUncertain()
-        SynchronizationOutcome.BLOCKED_CONFLICTS -> conflicts()
-        SynchronizationOutcome.BLOCKED_DIVERGED -> diverged()
-        SynchronizationOutcome.FETCH_ERROR -> fetchError()
-        SynchronizationOutcome.BLOCKED_CHANGES_ON_BOTH_SIDES,
-        SynchronizationOutcome.PUSH_REJECTED_REMOTE_CHANGED,
-        -> RepositoryHumanStatus(
-            "Hay cambios en los dos sitios.",
-            "Este dispositivo contiene cambios locales y GitHub también tiene cambios nuevos.",
-            "No es seguro aplicar una operación automática. RobGit no ha modificado nada.",
-            RepositoryAction.AI, blocked = true,
-        )
-        SynchronizationOutcome.ERROR -> genericError()
+    fun present(result: SynchronizationResult): RepositoryHumanStatus {
+        val downloaded = result.downloadResult?.outcome == DownloadOutcome.SUCCESS
+        val uploadIncomplete = result.uploadResult?.outcome?.let {
+            it != UploadOutcome.SUCCESS && it != UploadOutcome.NOTHING_TO_UPLOAD
+        } == true
+        if (downloaded && (uploadIncomplete || result.outcome == SynchronizationOutcome.ERROR)) {
+            return partialSynchronization(result)
+        }
+        if (result.outcome == SynchronizationOutcome.ERROR && result.downloadResult != null) {
+            return RepositoryHumanStatus(
+                "No he podido completar la sincronización.",
+                result.message,
+                "Analiza nuevamente el repositorio para comprobar el estado antes de continuar.",
+                blocked = true,
+            )
+        }
+        if (result.uploadResult?.commitCreated == true &&
+            (result.outcome == SynchronizationOutcome.FETCH_ERROR ||
+                result.outcome == SynchronizationOutcome.PUSH_REJECTED_REMOTE_CHANGED)) {
+            return uploadStoppedAfterCommit(result.uploadResult, result.message)
+        }
+        return when (result.outcome) {
+            SynchronizationOutcome.SUCCESS_DOWNLOADED,
+            SynchronizationOutcome.SUCCESS_UPLOADED,
+            SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED,
+            -> synchronizationCompleted(result.finalState)
+            SynchronizationOutcome.NOTHING_TO_DO -> RepositoryHumanStatus(
+                "Todo está al día.", "No era necesario hacer nada.",
+            )
+            SynchronizationOutcome.AUTH_REQUIRED -> if (result.finalState?.repositoryAccessDenied == true)
+                repositoryAccessDenied() else if (result.finalState?.authenticationRejected == true)
+                authFailed() else if (result.finalState?.authenticationRequired == true)
+                authorizationForReading() else authRequired()
+            SynchronizationOutcome.AUTH_FAILED -> if (result.uploadResult?.authenticationRejected == true)
+                authFailed() else repositoryAccessDenied()
+            SynchronizationOutcome.PUSH_UNCERTAIN -> pushUncertain()
+            SynchronizationOutcome.BLOCKED_CONFLICTS -> conflicts()
+            SynchronizationOutcome.BLOCKED_DIVERGED -> diverged()
+            SynchronizationOutcome.FETCH_ERROR -> fetchError()
+            SynchronizationOutcome.BLOCKED_OVERLAPPING_FILES -> RepositoryHumanStatus(
+                "Hay cambios incompatibles en ambos sitios.",
+                "Los mismos archivos han cambiado en este dispositivo y en GitHub, o sus rutas pueden colisionar. RobGit no ha realizado ningún cambio.",
+                "Puedes resolverlo manualmente o pedir a la IA que te lo explique.",
+                RepositoryAction.AI, blocked = true,
+            )
+            SynchronizationOutcome.BLOCKED_CHANGES_ON_BOTH_SIDES,
+            SynchronizationOutcome.PUSH_REJECTED_REMOTE_CHANGED,
+            -> RepositoryHumanStatus(
+                "Hay cambios en los dos sitios.",
+                "Este dispositivo contiene cambios locales y GitHub también tiene cambios nuevos.",
+                "No es seguro aplicar una operación automática. RobGit no ha modificado nada.",
+                RepositoryAction.AI, blocked = true,
+            )
+            SynchronizationOutcome.ERROR -> genericError()
+        }
     }
+
+    private fun synchronizationCompleted(finalState: RepositoryStateSnapshot?): RepositoryHumanStatus {
+        if (finalState == null || !finalState.remoteStateIsFresh || finalState.type == RepositoryStateType.ERROR) {
+            return RepositoryHumanStatus(
+                "La sincronización terminó; falta comprobar el estado final.",
+                "No he podido confirmar que este dispositivo y GitHub estén al día.",
+                "Analiza nuevamente el repositorio para comprobar el estado.",
+                blocked = true,
+            )
+        }
+        if (finalState.relation != CommitRelation.SYNCHRONIZED || finalState.changes.hasChanges) {
+            val current = present(finalState)
+            return current.copy(title = "La sincronización terminó; quedan cambios pendientes.")
+        }
+        return RepositoryHumanStatus(
+            "Sincronización completada.",
+            "Este dispositivo y GitHub están al día.",
+        )
+    }
+
+    private fun partialSynchronization(result: SynchronizationResult): RepositoryHumanStatus {
+        val uncertain = result.outcome == SynchronizationOutcome.PUSH_UNCERTAIN ||
+            result.uploadResult?.outcome == UploadOutcome.PUSH_UNCERTAIN
+        val needsAi = result.outcome == SynchronizationOutcome.BLOCKED_DIVERGED ||
+            result.outcome == SynchronizationOutcome.BLOCKED_CONFLICTS
+        val recommendation = when {
+            result.outcome == SynchronizationOutcome.AUTH_REQUIRED ||
+                result.outcome == SynchronizationOutcome.AUTH_FAILED -> "Conecta RobGit con GitHub desde Ajustes para continuar."
+            needsAi -> "Puedes pedir a la IA que te explique el bloqueo."
+            else -> "Analiza nuevamente el repositorio para comprobar el estado antes de continuar."
+        }
+        return RepositoryHumanStatus(
+            if (uncertain) "Descarga completada; subida sin confirmar." else "Descarga completada; subida pendiente.",
+            result.message,
+            recommendation,
+            if (needsAi) RepositoryAction.AI else null,
+            blocked = true,
+        )
+    }
+
+    private fun uploadStoppedAfterCommit(result: UploadResult, message: String = result.message) = RepositoryHumanStatus(
+        if (result.outcome == UploadOutcome.FETCH_ERROR) "Cambios guardados localmente; subida pendiente."
+            else "GitHub tiene cambios nuevos.",
+        message,
+        "Analiza nuevamente el repositorio para comprobar el estado antes de continuar.",
+        blocked = true,
+    )
 
     private fun fetchError() = RepositoryHumanStatus(
         "No he podido comprobar GitHub.", "Tus archivos locales no han sido modificados.",

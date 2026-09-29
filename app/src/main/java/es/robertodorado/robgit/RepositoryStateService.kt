@@ -124,8 +124,10 @@ data class UploadResult(
 enum class SynchronizationOutcome {
     SUCCESS_DOWNLOADED,
     SUCCESS_UPLOADED,
+    SUCCESS_DOWNLOADED_AND_UPLOADED,
     NOTHING_TO_DO,
     BLOCKED_CHANGES_ON_BOTH_SIDES,
+    BLOCKED_OVERLAPPING_FILES,
     BLOCKED_DIVERGED,
     BLOCKED_CONFLICTS,
     AUTH_REQUIRED,
@@ -585,6 +587,7 @@ class RepositoryStateService(
                         git = git,
                         previousHead = previousHead,
                         attemptedHead = attemptedHead,
+                        finalState = initialState,
                     )
                 }
 
@@ -753,7 +756,7 @@ class RepositoryStateService(
         }
     }
 
-    /** Chooses at most one already-validated operation: no action, fast-forward download, or upload. */
+    /** Revalidates real state; disjoint pending work can survive a verified FF before safe upload. */
     override fun synchronizeSafely(
         repositoryDirectory: File,
         token: CharArray,
@@ -810,12 +813,7 @@ class RepositoryStateService(
                 }
                 CommitRelation.REMOTE_AHEAD -> {
                     if (state.changes.hasChanges) {
-                        SynchronizationResult(
-                            outcome = SynchronizationOutcome.BLOCKED_CHANGES_ON_BOTH_SIDES,
-                            message = "Hay cambios tanto en este dispositivo como en GitHub. " +
-                                "RobGit no realizará ninguna operación automática.",
-                            finalState = state,
-                        )
+                        synchronizeDisjointChanges(repositoryDirectory, token, commitMessage, state)
                     } else {
                         mapDownloadForSynchronization(downloadFastForward(repositoryDirectory, token.copyOf()))
                     }
@@ -841,6 +839,205 @@ class RepositoryStateService(
             Arrays.fill(token, '\u0000')
         }
     }
+
+    private fun synchronizeDisjointChanges(
+        repositoryDirectory: File,
+        token: CharArray,
+        commitMessage: String,
+        fetchedState: RepositoryStateSnapshot,
+    ): SynchronizationResult {
+        val credentials = if (token.isNotEmpty()) githubJGitCredentials(token) else null
+        var checkoutAttempted = false
+        var download: DownloadResult? = null
+        var latestState = fetchedState
+        try {
+            Git.open(repositoryDirectory).use { git ->
+                validateFunctionalRepository(git)
+                val repository = git.repository
+                val initial = inspectFetchedState(git, Instant.now())
+                latestState = initial
+                check(initial.localHead == fetchedState.localHead &&
+                    initial.remoteHead == fetchedState.remoteHead && initial.changes == fetchedState.changes) {
+                    "El repositorio cambió después del fetch inicial."
+                }
+                checkSafeRemoteAdvance(initial)
+                val baselineHead = requireNotNull(repository.resolve(Constants.HEAD))
+                val baselineRemote = requireNotNull(repository.resolve(remoteTrackingRef))
+                val baseline = SynchronizationSafety.captureLocalWork(git, initial.changes)
+                val initialPaths = SynchronizationSafety.affectedRemotePaths(repository, baselineHead, baselineRemote)
+                if (SynchronizationSafety.hasCollision(baseline, initialPaths)) return overlappingFiles(initial)
+                SynchronizationSafety.verifyCheckoutIsSafe(repository, baselineHead, baselineRemote, initialPaths)
+                if (token.isEmpty()) {
+                    return SynchronizationResult(
+                        SynchronizationOutcome.AUTH_REQUIRED,
+                        "Conecta RobGit con GitHub desde Ajustes para sincronizar y subir tu trabajo. " +
+                            "RobGit no ha realizado ningún cambio.",
+                        initial,
+                    )
+                }
+                if (commitMessage.trim().isEmpty()) {
+                    return SynchronizationResult(
+                        SynchronizationOutcome.ERROR,
+                        "El mensaje del cambio no puede estar vacío. RobGit no ha realizado ningún cambio.",
+                        initial,
+                    )
+                }
+
+                // Fetch again after capturing content/index, before allowing any HEAD/tree mutation.
+                try {
+                    fetchOrigin(git, credentials)
+                } catch (failure: Throwable) {
+                    if (failure !is Exception && failure !is LinkageError) throw failure
+                    val authenticationFailed = isAuthenticationFailure(failure)
+                    val failureState = errorSnapshot(Instant.now(),
+                        "No se pudo volver a comprobar GitHub antes de descargar.", failure,
+                        authenticationRequired = authenticationFailed,
+                        authenticationRejected = authenticationFailed && isExplicitAuthenticationRejection(failure))
+                    return SynchronizationResult(
+                        outcome = if (authenticationFailed) SynchronizationOutcome.AUTH_FAILED
+                            else SynchronizationOutcome.FETCH_ERROR,
+                        message = "No se pudo volver a comprobar GitHub. RobGit no ha realizado ningún cambio.",
+                        finalState = failureState,
+                        error = safeFailure("Revalidación antes del fast-forward", failure),
+                    )
+                }
+                val revalidated = inspectFetchedState(git, Instant.now())
+                latestState = revalidated
+                check(revalidated.localHead == baselineHead.name) { "HEAD local cambió durante la comprobación."
+                }
+                check(SynchronizationSafety.captureLocalWork(git, revalidated.changes) == baseline) {
+                    "El trabajo local o el índice cambiaron durante la comprobación."
+                }
+                if (revalidated.relation == CommitRelation.DIVERGED) {
+                    return SynchronizationResult(SynchronizationOutcome.BLOCKED_DIVERGED,
+                        "Las dos copias han divergido. RobGit no ha realizado ningún cambio.", revalidated)
+                }
+                checkSafeRemoteAdvance(revalidated)
+                val decidedRemote = requireNotNull(repository.resolve(remoteTrackingRef))
+                // A changed remote is acceptable only after recomputing its complete set of paths.
+                val remotePaths = SynchronizationSafety.affectedRemotePaths(repository, baselineHead, decidedRemote)
+                if (SynchronizationSafety.hasCollision(baseline, remotePaths)) return overlappingFiles(revalidated)
+                SynchronizationSafety.verifyCheckoutIsSafe(repository, baselineHead, decidedRemote, remotePaths)
+
+                // Last local guard also covers changes during diff/preflight/hash work.
+                validateFunctionalRepository(git)
+                check(SynchronizationSafety.captureLocalWork(git, readWorkingTreeChanges(git)) == baseline) {
+                    "El trabajo local cambió antes del fast-forward."
+                }
+                check(repository.resolve(Constants.HEAD) == baselineHead &&
+                    repository.resolve(remoteTrackingRef) == decidedRemote) {
+                    "Las referencias cambiaron antes del fast-forward."
+                }
+                checkoutAttempted = true
+                val merge = git.merge().include(decidedRemote)
+                    .setFastForward(MergeCommand.FastForwardMode.FF_ONLY)
+                    .setCommit(false).call()
+                check(merge.mergeStatus == MergeResult.MergeStatus.FAST_FORWARD) {
+                    "JGit no aceptó un fast-forward seguro."
+                }
+                val after = inspectFetchedState(git, Instant.now())
+                latestState = after
+                check(repository.resolve(Constants.HEAD) == decidedRemote &&
+                    repository.resolve(remoteTrackingRef) == decidedRemote) {
+                    "La descarga no terminó en el commit remoto decidido."
+                }
+                validateFunctionalRepository(git)
+                check(after.relation == CommitRelation.SYNCHRONIZED && after.ahead == 0 &&
+                    after.behind == 0 && after.changes.conflictingFiles.isEmpty()) {
+                    "La descarga no dejó un estado Git seguro."
+                }
+                SynchronizationSafety.verifyLocalWorkPreserved(baseline,
+                    SynchronizationSafety.captureLocalWork(git, after.changes), remotePaths)
+                SynchronizationSafety.verifyRemoteFilesApplied(repository, decidedRemote, remotePaths)
+                download = DownloadResult(
+                    DownloadOutcome.SUCCESS,
+                    "Los cambios de GitHub se descargaron y el contenido e índice locales siguen intactos.",
+                    baselineHead.name, decidedRemote.name, revalidated.behind,
+                    workingTreeClean = !after.changes.hasChanges, finalState = after,
+                )
+            }
+            // Keep the original upload contract, including both fetches, commit and normal push.
+            val upload = uploadSafely(repositoryDirectory, token.copyOf(), commitMessage)
+            val mapped = mapUploadForSynchronization(upload)
+            val successfulDownload = requireNotNull(download)
+            return if (upload.outcome == UploadOutcome.NOTHING_TO_UPLOAD) {
+                mapped.copy(outcome = SynchronizationOutcome.SUCCESS_DOWNLOADED,
+                    message = "Los cambios de GitHub se descargaron correctamente. " +
+                        "Ya no había trabajo local pendiente de subir.", downloadResult = successfulDownload)
+            } else if (upload.outcome == UploadOutcome.SUCCESS) {
+                mapped.copy(outcome = SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED,
+                    message = "Sincronización completada: se descargaron los cambios de GitHub y se subió " +
+                        "el trabajo local. ${upload.message}", downloadResult = successfulDownload)
+            } else {
+                val remoteChanged = upload.outcome == UploadOutcome.BLOCKED_REMOTE_AHEAD ||
+                    upload.outcome == UploadOutcome.BLOCKED_DIVERGED ||
+                    upload.outcome == UploadOutcome.PUSH_REJECTED_REMOTE_CHANGED
+                var finalError = mapped.error
+                val finalState = upload.finalState ?: try {
+                    Git.open(repositoryDirectory).use { git ->
+                        validateRepositoryIdentity(git)
+                        // Read current HEAD/index, rather than returning the pre-commit download snapshot.
+                        // No new fetch succeeded here, so the remote state must remain unverified.
+                        inspectFetchedState(git, Instant.now()).copy(remoteStateIsFresh = false)
+                    }
+                } catch (failure: Throwable) {
+                    if (failure !is Exception && failure !is LinkageError) throw failure
+                    finalError = listOfNotNull(finalError, safeFailure("Estado local después de la subida", failure))
+                        .joinToString("; ")
+                    null
+                }
+                mapped.copy(
+                    outcome = if (remoteChanged) SynchronizationOutcome.PUSH_REJECTED_REMOTE_CHANGED
+                        else mapped.outcome,
+                    message = if (remoteChanged) {
+                        "Los cambios de GitHub se descargaron correctamente, pero GitHub volvió a cambiar " +
+                            "antes de poder subir el trabajo local. Tus cambios locales permanecen intactos" +
+                            (if (upload.commitCreated) " y guardados en un commit local." else ".")
+                    } else {
+                        "Los cambios de GitHub se descargaron correctamente, pero la subida no se pudo completar. " +
+                            "El trabajo local se conserva en este dispositivo. ${upload.message}"
+                    },
+                    finalState = finalState,
+                    downloadResult = successfulDownload,
+                    error = finalError,
+                )
+            }
+        } catch (failure: Throwable) {
+            if (failure !is Exception && failure !is LinkageError) throw failure
+            // Checkout may have written files even if updating HEAD failed. Never claim no mutation then.
+            return SynchronizationResult(
+                SynchronizationOutcome.ERROR,
+                if (checkoutAttempted) {
+                    "La descarga se detuvo durante su aplicación o verificación. No se creó ningún commit " +
+                        "ni se intentó subir. Revisa el estado del repositorio antes de continuar."
+                } else {
+                    "El repositorio cambió o no se pudo demostrar una descarga segura. " +
+                        "RobGit no ha realizado ningún cambio."
+                },
+                finalState = if (checkoutAttempted) null else latestState,
+                downloadResult = download ?: if (checkoutAttempted) DownloadResult(
+                    DownloadOutcome.ERROR, "El fast-forward no pudo verificarse.",
+                    fetchedState.localHead, null, 0, false, null,
+                ) else null,
+                error = safeFailure("Sincronización de rutas disjuntas", failure),
+            )
+        } finally {
+            credentials?.clear()
+        }
+    }
+
+    private fun checkSafeRemoteAdvance(state: RepositoryStateSnapshot) {
+        check(state.relation == CommitRelation.REMOTE_AHEAD && state.ahead == 0 && state.behind > 0 &&
+            state.changes.conflictingFiles.isEmpty()) { "El estado no permite un fast-forward seguro."
+        }
+    }
+
+    private fun overlappingFiles(state: RepositoryStateSnapshot) = SynchronizationResult(
+        SynchronizationOutcome.BLOCKED_OVERLAPPING_FILES,
+        "Hay cambios incompatibles en ambos sitios. Los mismos archivos han sido modificados en este " +
+            "dispositivo y en GitHub, o sus rutas pueden colisionar. RobGit no ha realizado ningún cambio.",
+        state,
+    )
 
     private fun mapDownloadForSynchronization(download: DownloadResult): SynchronizationResult =
         SynchronizationResult(

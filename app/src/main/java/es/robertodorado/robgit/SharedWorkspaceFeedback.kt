@@ -46,6 +46,7 @@ internal fun sharedWorkspaceFeedback(result: SharedWorkspaceResult): SharedWorks
             SynchronizationOutcome.NOTHING_TO_DO.name -> SharedWorkspaceFeedback("El workspace ya estaba sincronizado", result.message)
             SynchronizationOutcome.SUCCESS_DOWNLOADED.name -> SharedWorkspaceFeedback("Sincronización completada: cambios descargados", result.message)
             SynchronizationOutcome.SUCCESS_UPLOADED.name -> SharedWorkspaceFeedback("Sincronización completada: cambios subidos", result.message)
+            SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED.name -> SharedWorkspaceFeedback("Sincronización completada: cambios descargados y subidos", result.message)
             else -> SharedWorkspaceFeedback("Sincronización completada", result.message)
         }
         else -> SharedWorkspaceFeedback("Operación completada", result.message)

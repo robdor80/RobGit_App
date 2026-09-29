@@ -133,6 +133,57 @@ class RepositoryStateServiceTest {
     }
 
     @Test
+    fun remoteAheadSnapshotKeepsAllPendingWorkingTreeAndIndexCategories() {
+        val fixture = fixture()
+        val initialHead = head(fixture.local)
+        File(fixture.local, "tracked.txt").writeText("modificado local")
+        assertTrue(File(fixture.local, "README.md").delete())
+        File(fixture.local, "nuevo.txt").writeText("nuevo local")
+        File(fixture.local, "staged.txt").writeText("preparado local")
+        Git.open(fixture.local).use { it.add().addFilepattern("staged.txt").call() }
+        commitAndPush(fixture.writer, "remote.txt", "remoto", "avance remoto")
+
+        val state = fixture.service.refreshState(fixture.local)
+
+        assertState(state, RepositoryStateType.LOCAL_CHANGES, CommitRelation.REMOTE_AHEAD, 0, 1)
+        assertEquals(initialHead, state.localHead)
+        assertEquals(setOf("nuevo.txt", "staged.txt"), state.changes.newFiles)
+        assertEquals(setOf("tracked.txt"), state.changes.modifiedFiles)
+        assertEquals(setOf("README.md"), state.changes.deletedFiles)
+        assertEquals(setOf("staged.txt"), state.changes.stagedFiles)
+        assertTrue(state.changes.conflictingFiles.isEmpty())
+        assertFalse(File(fixture.local, "remote.txt").exists())
+    }
+
+    @Test
+    fun directPullStillBlocksRemoteAheadWithMixedDisjointLocalWork() {
+        val fixture = fixture()
+        val initialHead = head(fixture.local)
+        File(fixture.local, "tracked.txt").writeText("modificado local")
+        assertTrue(File(fixture.local, "README.md").delete())
+        File(fixture.local, "nuevo.txt").writeText("nuevo local")
+        File(fixture.local, "staged.txt").writeText("preparado local")
+        val stagedBlob = Git.open(fixture.local).use { git ->
+            git.add().addFilepattern("staged.txt").call()
+            git.repository.readDirCache().getEntry("staged.txt").objectId.name
+        }
+        commitAndPush(fixture.writer, "remote.txt", "remoto", "avance remoto")
+
+        val result = fixture.service.downloadFastForward(fixture.local)
+
+        assertEquals(DownloadOutcome.BLOCKED_LOCAL_CHANGES, result.outcome)
+        assertEquals(initialHead, head(fixture.local))
+        assertEquals("modificado local", File(fixture.local, "tracked.txt").readText())
+        assertEquals("nuevo local", File(fixture.local, "nuevo.txt").readText())
+        assertEquals("preparado local", File(fixture.local, "staged.txt").readText())
+        assertFalse(File(fixture.local, "README.md").exists())
+        assertFalse(File(fixture.local, "remote.txt").exists())
+        Git.open(fixture.local).use { git ->
+            assertEquals(stagedBlob, git.repository.readDirCache().getEntry("staged.txt").objectId.name)
+        }
+    }
+
+    @Test
     fun fetchFailureNeverReportsSynchronizedState() {
         val fixture = fixture()
         val missingRemote = File(temporaryFolder.root, "missing.git")

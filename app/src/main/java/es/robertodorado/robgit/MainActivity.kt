@@ -498,7 +498,9 @@ private fun RobGitScreen(
                 result.finalState?.let { repositoryState = it }
                 lastOperation = RestoredOperation("SINCRONIZAR", result.outcome.name, result.message, result.error)
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
-                if (result.outcome == SynchronizationOutcome.AUTH_REQUIRED) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
+                if (result.outcome == SynchronizationOutcome.AUTH_REQUIRED &&
+                    result.downloadResult?.outcome != DownloadOutcome.SUCCESS
+                ) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
             } catch (failure: GitAccessUnavailableException) {
                 setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
             } finally { runningOperation = null }
@@ -575,7 +577,7 @@ private fun RobGitScreen(
                             }
                             ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
                                 ::requestPushCommitMessage,
-                                { if (baseStatus.recommendedAction == RepositoryAction.PUSH) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
+                                { if (baseStatus.recommendedAction == RepositoryAction.PUSH || baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
                                 { showAi = true }, Modifier.weight(.85f))
                         }
                     } else {
@@ -584,7 +586,7 @@ private fun RobGitScreen(
                         Spacer(Modifier.height(if (tablet) 28.dp else 22.dp))
                         ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
                             ::requestPushCommitMessage,
-                            { if (baseStatus.recommendedAction == RepositoryAction.PUSH) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
+                            { if (baseStatus.recommendedAction == RepositoryAction.PUSH || baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
                             { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp))
                     }
                 }

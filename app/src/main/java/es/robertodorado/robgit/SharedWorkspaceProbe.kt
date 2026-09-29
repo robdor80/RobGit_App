@@ -81,7 +81,7 @@ class SharedWorkspaceProbe(
         val result = service().synchronizeSafely(path, token, message)
         SharedWorkspaceResult("SINCRONIZAR WORKSPACE",
             result.outcome in setOf(SynchronizationOutcome.NOTHING_TO_DO, SynchronizationOutcome.SUCCESS_DOWNLOADED,
-                SynchronizationOutcome.SUCCESS_UPLOADED), result.message, path.absolutePath,
+                SynchronizationOutcome.SUCCESS_UPLOADED, SynchronizationOutcome.SUCCESS_DOWNLOADED_AND_UPLOADED), result.message, path.absolutePath,
             result.finalState, result.outcome.name, result.outcome == SynchronizationOutcome.AUTH_REQUIRED ||
                 result.outcome == SynchronizationOutcome.AUTH_FAILED,
             result.finalState?.authenticationRejected == true || result.uploadResult?.authenticationRejected == true)
