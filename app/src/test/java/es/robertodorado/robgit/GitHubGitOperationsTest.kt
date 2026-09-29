@@ -11,6 +11,27 @@ import java.time.Instant
 class GitHubGitOperationsTest {
     private val directory = File("unused-test-repository")
 
+    @Test fun localBridgeBypassesOAuthAndRemoteEngine() = runTest {
+        val provider = object : GitHubAccessTokenProvider {
+            override val state = MutableStateFlow<GitHubConnectionState>(GitHubConnectionState.NeedsReauth)
+            override suspend fun validAccessToken(): String? = error("Local read must not request credentials")
+            override suspend fun reportAuthenticationRejected() = error("Local read cannot reject credentials")
+        }
+        var localReads = 0
+        val reader = object : RepositoryLocalStateReader {
+            override fun refreshLocalState(repositoryDirectory: File, previous: RepositoryStateSnapshot?): RepositoryStateSnapshot {
+                localReads++
+                assertEquals(directory, repositoryDirectory)
+                return RepositoryStateSnapshot(RepositoryStateType.LOCAL_CHANGES, CommitRelation.SYNCHRONIZED,
+                    "local", "main", "head", "head", 0, 0, WorkingTreeChanges(newFiles = setOf("new")),
+                    Instant.EPOCH, false)
+            }
+        }
+        val local = GitHubGitOperations(provider).refreshLocal(reader, directory, null)
+        assertEquals(1, localReads)
+        assertFalse(local.remoteStateIsFresh)
+    }
+
     @Test fun publicRepositoryReadsAnonymouslyWhenDisconnected() = runTest {
         val provider = FakeProvider()
         val engine = FakeEngine()

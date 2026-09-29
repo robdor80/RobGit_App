@@ -56,12 +56,37 @@ object RepositoryStatusPresenter {
                 blocked = true,
             )
         }
-        if (!state.remoteStateIsFresh || state.type == RepositoryStateType.ERROR) {
+        if (!state.localRepositoryIsSafe) return RepositoryHumanStatus(
+            "Hay una operación Git local pendiente.",
+            "Completa o revisa la operación antes de continuar.", blocked = true,
+        )
+        if (state.type == RepositoryStateType.ERROR) {
             return RepositoryHumanStatus(
                 "No he podido comprobar GitHub.",
                 "Tus archivos locales no han sido modificados.",
                 "Comprueba tu conexión y vuelve a analizar.",
                 blocked = true,
+            )
+        }
+        if (!state.remoteStateIsFresh) {
+            val mayPush = state.remoteCheckedAt != null &&
+                (state.relation == CommitRelation.SYNCHRONIZED || state.relation == CommitRelation.LOCAL_AHEAD) &&
+                (state.changes.hasChanges || state.ahead > 0)
+            return RepositoryHumanStatus(
+                title = when {
+                    state.relation == CommitRelation.DIVERGED -> "Las dos copias han evolucionado por separado."
+                    state.changes.hasChanges -> "Tienes trabajo local pendiente."
+                    state.ahead > 0 -> "Tienes cambios pendientes de subir."
+                    else -> "Estado local actualizado."
+                },
+                explanation = if (state.remoteCheckedAt != null)
+                    "GitHub no se ha vuelto a comprobar desde el último análisis."
+                    else "Falta comprobar el estado de GitHub.",
+                recommendation = if (mayPush) "Puedes hacer PUSH: RobGit comprobará GitHub antes de subir."
+                    else "Pulsa el logo para comprobar GitHub.",
+                recommendedAction = if (mayPush) RepositoryAction.PUSH else null,
+                pushEnabled = mayPush,
+                blocked = !mayPush,
             )
         }
         if (state.relation == CommitRelation.DIVERGED) {

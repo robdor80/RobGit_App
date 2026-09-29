@@ -5,6 +5,42 @@ import org.junit.Test
 import java.time.Instant
 
 class RepositoryHumanStatusTest {
+    @Test fun cachedLocalChangesOfferRevalidatedPushWithoutClaimingFreshRemote() {
+        val fresh = state(RepositoryStateType.LOCAL_CHANGES, CommitRelation.SYNCHRONIZED,
+            changes = WorkingTreeChanges(modifiedFiles = setOf("file")))
+        val local = fresh.copy(remoteStateIsFresh = false)
+        val shown = RepositoryStatusPresenter.present(local)
+        assertEquals("Tienes trabajo local pendiente.", shown.title)
+        assertTrue(shown.pushEnabled)
+        assertTrue(shown.recommendation.orEmpty().contains("comprobará GitHub"))
+        assertFalse(shown.explanation.contains("misma versión"))
+        assertFalse(shown.pullEnabled)
+    }
+
+    @Test fun cachedRemoteAheadAndDivergedStatesNeverEnableDirectionalActions() {
+        for (relation in listOf(CommitRelation.REMOTE_AHEAD, CommitRelation.DIVERGED)) {
+            val cached = state(RepositoryStateType.LOCAL_CHANGES, relation, behind = 1,
+                changes = WorkingTreeChanges(newFiles = setOf("file"))).copy(remoteStateIsFresh = false)
+            val shown = RepositoryStatusPresenter.present(cached)
+            assertFalse(shown.pullEnabled || shown.pushEnabled)
+            assertTrue(shown.blocked)
+        }
+    }
+
+    @Test fun cachedCleanStateNeverClaimsEverythingIsUpToDate() {
+        val cached = state(RepositoryStateType.SYNCHRONIZED, CommitRelation.SYNCHRONIZED).copy(remoteStateIsFresh = false)
+        assertEquals("Estado local actualizado.", RepositoryStatusPresenter.present(cached).title)
+        assertTrue(RepositoryStatusPresenter.present(cached).blocked)
+    }
+
+    @Test fun incompleteLocalOperationBlocksEvenWithKnownRemote() {
+        val local = state(RepositoryStateType.LOCAL_CHANGES, CommitRelation.SYNCHRONIZED,
+            changes = WorkingTreeChanges(modifiedFiles = setOf("file")))
+            .copy(remoteStateIsFresh = false, localRepositoryIsSafe = false)
+        val shown = RepositoryStatusPresenter.present(local)
+        assertFalse(shown.pushEnabled)
+        assertTrue(shown.blocked)
+    }
     @Test fun noRepositoriesShowsAnEmptyState() {
         assertEquals("No tienes repositorios configurados.", RepositoryStatusPresenter.noRepositories.title)
     }

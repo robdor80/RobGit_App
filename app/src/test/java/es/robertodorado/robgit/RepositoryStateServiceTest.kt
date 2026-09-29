@@ -5,6 +5,7 @@ import org.eclipse.jgit.transport.RefSpec
 import org.eclipse.jgit.transport.URIish
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -13,6 +14,152 @@ import java.io.File
 
 class RepositoryStateServiceTest {
     @get:Rule val temporaryFolder = TemporaryFolder()
+
+    @Test fun localRefreshReportsModifiedNewDeletedAndStagedWithoutFetch() {
+        val fixture = fixture()
+        val previous = fixture.service.refreshState(fixture.local)
+        File(fixture.local, "tracked.txt").writeText("external edit")
+        assertTrue(File(fixture.local, "README.md").delete())
+        File(fixture.local, "new.txt").writeText("new")
+        File(fixture.local, "staged.txt").writeText("staged")
+        Git.open(fixture.local).use { it.add().addFilepattern("staged.txt").call() }
+        val gateway = CountingGateway()
+        val state = RepositoryStateService(fixture.remote.toURI().toString(), gateway)
+            .refreshLocalState(fixture.local, previous)
+        assertEquals(setOf("tracked.txt"), state.changes.modifiedFiles)
+        assertEquals(setOf("README.md"), state.changes.deletedFiles)
+        assertEquals(setOf("new.txt", "staged.txt"), state.changes.newFiles)
+        assertEquals(setOf("staged.txt"), state.changes.stagedFiles)
+        assertEquals(0, gateway.fetches)
+        assertFalse(state.remoteStateIsFresh)
+        assertEquals(previous.remoteCheckedAt, state.remoteCheckedAt)
+        assertTrue(state.localStateIsFresh)
+        assertTrue(RepositoryStatusPresenter.present(state).pushEnabled)
+    }
+
+    @Test fun localRefreshReportsAtomicRenameAsNewAndDeletedFiles() {
+        val fixture = fixture()
+        val previous = fixture.service.refreshState(fixture.local)
+        assertTrue(File(fixture.local, "tracked.txt").renameTo(File(fixture.local, "renamed.txt")))
+        val state = fixture.service.refreshLocalState(fixture.local, previous)
+        assertEquals(setOf("tracked.txt"), state.changes.deletedFiles)
+        assertEquals(setOf("renamed.txt"), state.changes.newFiles)
+        assertFalse(state.remoteStateIsFresh)
+    }
+
+    @Test fun localRefreshDoesNotPretendToKnowNewRemoteCommits() {
+        val fixture = fixture()
+        val previous = fixture.service.refreshState(fixture.local)
+        commitAndPush(fixture.writer, "remote.txt", "remote", "remote advance")
+        val gateway = CountingGateway()
+        val service = RepositoryStateService(fixture.remote.toURI().toString(), gateway)
+        val local = service.refreshLocalState(fixture.local, previous)
+        assertEquals(previous.remoteHead, local.remoteHead)
+        assertEquals(previous.remoteCheckedAt, local.remoteCheckedAt)
+        assertFalse(local.remoteStateIsFresh)
+        assertFalse(RepositoryStatusPresenter.present(local).title.contains("al día"))
+        assertEquals(0, gateway.fetches)
+        val full = service.refreshState(fixture.local)
+        assertEquals(1, gateway.fetches)
+        assertTrue(full.remoteStateIsFresh)
+        assertEquals(CommitRelation.REMOTE_AHEAD, full.relation)
+    }
+
+    @Test fun repeatedLocalRefreshesKeepOriginalRemoteTime() {
+        val fixture = fixture()
+        val previous = fixture.service.refreshState(fixture.local)
+        val first = fixture.service.refreshLocalState(fixture.local, previous)
+        val second = fixture.service.refreshLocalState(fixture.local, first)
+        assertEquals(previous.remoteCheckedAt, second.remoteCheckedAt)
+        assertFalse(second.remoteStateIsFresh)
+    }
+
+    @Test fun changedTrackingRefOrBranchDoesNotReuseRemoteVerification() {
+        val fixture = fixture()
+        val previous = fixture.service.refreshState(fixture.local)
+        for (incompatible in listOf(previous.copy(remoteHead = "other"), previous.copy(branch = "other"))) {
+            val local = fixture.service.refreshLocalState(fixture.local, incompatible)
+            assertNull(local.remoteCheckedAt)
+            assertFalse(RepositoryStatusPresenter.present(local).pushEnabled)
+        }
+    }
+
+    @Test fun unknownOrFailedRemoteKnowledgeCannotEnablePush() {
+        val fixture = fixture()
+        File(fixture.local, "new.txt").writeText("new")
+        val failed = fixture.service.refreshState(fixture.local).copy(type = RepositoryStateType.ERROR)
+        for (previous in listOf(null, failed)) {
+            val local = fixture.service.refreshLocalState(fixture.local, previous)
+            assertNull(local.remoteCheckedAt)
+            assertFalse(RepositoryStatusPresenter.present(local).pushEnabled)
+            assertEquals("Tienes trabajo local pendiente.", RepositoryStatusPresenter.present(local).title)
+        }
+    }
+
+    @Test fun externalMergeConflictsAreReadAndRemainBlocked() {
+        val fixture = fixture()
+        val previous = fixture.service.refreshState(fixture.local)
+        Git.open(fixture.local).use { it.checkout().setCreateBranch(true).setName("side").call() }
+        commit(fixture.local, "tracked.txt", "side contents", "side edit")
+        val side = head(fixture.local)
+        Git.open(fixture.local).use { it.checkout().setName("main").call() }
+        commit(fixture.local, "tracked.txt", "main contents", "main edit")
+        Git.open(fixture.local).use { it.merge().include(org.eclipse.jgit.lib.ObjectId.fromString(side)).call() }
+        val local = fixture.service.refreshLocalState(fixture.local, previous)
+        assertEquals(setOf("tracked.txt"), local.changes.conflictingFiles)
+        assertTrue(local.localStateIsFresh)
+        assertFalse(local.localRepositoryIsSafe)
+        assertTrue(RepositoryStatusPresenter.present(local).blocked)
+    }
+
+    @Test fun localRefreshIsPureReadOfWorkingTreeIndexAndRefs() {
+        val fixture = fixture()
+        File(fixture.local, "tracked.txt").writeText("external contents")
+        fun bytes(): Map<String, String> = java.nio.file.Files.walk(fixture.local.toPath()).use { paths ->
+            paths.filter { java.nio.file.Files.isRegularFile(it) }.toList().associate {
+                fixture.local.toPath().relativize(it).toString() to java.nio.file.Files.readAllBytes(it).joinToString()
+            }
+        }
+        val before = bytes()
+        val state = fixture.service.refreshLocalState(fixture.local, null)
+        assertTrue(state.localStateIsFresh)
+        assertEquals(before, bytes())
+    }
+
+    @Test fun localRefreshNeverInvokesHeavySynchronizationPhases() {
+        val fixture = fixture()
+        File(fixture.local, "new.txt").writeText("new")
+        val recorder = SyncPerformanceRecorder { 0 }
+        SyncPerformance.withRecorder(recorder) { fixture.service.refreshLocalState(fixture.local, null) }
+        val report = recorder.snapshot()
+        assertEquals(1L, report.counters[SyncCounter.STATUS_CALLS])
+        for (counter in listOf(SyncCounter.FETCH_CALLS, SyncCounter.CAPTURE_CALLS,
+            SyncCounter.FINGERPRINTS, SyncCounter.SHA256_FILES, SyncCounter.WORKING_OBJECTS,
+            SyncCounter.ADD_CALLS, SyncCounter.COMMIT_CALLS, SyncCounter.PUSH_CALLS)) {
+            assertEquals(counter.name, 0L, report.counters[counter] ?: 0L)
+        }
+        assertFalse(report.timings.any { it.phase in setOf(SyncPhase.CAPTURE, SyncPhase.FINGERPRINT,
+            SyncPhase.SHA_READ, SyncPhase.ADD, SyncPhase.FETCH) })
+    }
+
+    @Test fun missingWorkspaceReturnsSafeLocalError() {
+        val fixture = fixture()
+        val local = fixture.service.refreshLocalState(File(fixture.local, "missing"), null)
+        assertEquals(RepositoryStateType.ERROR, local.type)
+        assertFalse(local.localStateIsFresh)
+        assertFalse(local.remoteStateIsFresh)
+        assertTrue(RepositoryStatusPresenter.present(local).blocked)
+    }
+
+    private class CountingGateway : RepositoryRemoteGateway {
+        var fetches = 0
+        override fun fetch(git: Git, credentials: org.eclipse.jgit.transport.CredentialsProvider?) {
+            fetches++
+            JGitRepositoryRemoteGateway().fetch(git, credentials)
+        }
+        override fun pushMain(git: Git, credentials: org.eclipse.jgit.transport.CredentialsProvider): PushTransportResult =
+            error("Local refresh must never push")
+    }
 
     @Test
     fun synchronizedWhenHeadsMatchAndTreeIsClean() {

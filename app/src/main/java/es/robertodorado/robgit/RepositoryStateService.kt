@@ -62,6 +62,10 @@ data class RepositoryStateSnapshot(
     val authenticationRequired: Boolean = false,
     val authenticationRejected: Boolean = false,
     val repositoryAccessDenied: Boolean = false,
+    /** Local refreshes keep the last verified remote time, never advance it. */
+    val remoteCheckedAt: Instant? = if (remoteStateIsFresh) checkedAt else null,
+    val localStateIsFresh: Boolean = type != RepositoryStateType.ERROR,
+    val localRepositoryIsSafe: Boolean = true,
 )
 
 data class RepositoryPreparationResult(
@@ -164,12 +168,17 @@ interface RepositoryGitEngine {
         }
 }
 
+/** Local reads have a separate API with no token or remote operation. */
+interface RepositoryLocalStateReader {
+    fun refreshLocalState(repositoryDirectory: File, previous: RepositoryStateSnapshot?): RepositoryStateSnapshot
+}
+
 /** Safe Git operations scoped to one configured remote and branch. */
 class RepositoryStateService(
     private val repositoryUrl: String,
     private val remoteGateway: RepositoryRemoteGateway = JGitRepositoryRemoteGateway(),
     private val branch: String = "main",
-) : RepositoryGitEngine {
+) : RepositoryGitEngine, RepositoryLocalStateReader {
     private val remoteTrackingRef: String get() = "refs/remotes/origin/$branch"
 
     fun isPrepared(repositoryDirectory: File): Boolean = try {
@@ -317,6 +326,35 @@ class RepositoryStateService(
                 credentials?.clear()
                 Arrays.fill(token, '\u0000')
             }
+        }
+    }
+
+    /** Pure local read: status/index and cached refs only; no credentials, network or writes. */
+    override fun refreshLocalState(repositoryDirectory: File, previous: RepositoryStateSnapshot?): RepositoryStateSnapshot {
+        val checkedAt = Instant.now()
+        return try {
+            check(repositoryDirectory.canRead() && File(repositoryDirectory, ".git").isDirectory)
+            Git.open(repositoryDirectory).use { git ->
+                validateRepositoryIdentity(git)
+                val local = inspectFetchedState(git, checkedAt, remoteStateIsFresh = false)
+                val knownRemote = previous?.takeIf {
+                    it.type != RepositoryStateType.ERROR && it.remoteCheckedAt != null &&
+                        it.branch == local.branch && it.remoteHead == local.remoteHead &&
+                        !it.authenticationRequired && !it.authenticationRejected && !it.repositoryAccessDenied
+                }
+                local.copy(
+                    remoteCheckedAt = knownRemote?.remoteCheckedAt,
+                    message = "Estado local actualizado. GitHub no se ha vuelto a comprobar.",
+                    authenticationRequired = previous?.authenticationRequired == true,
+                    authenticationRejected = previous?.authenticationRejected == true,
+                    repositoryAccessDenied = previous?.repositoryAccessDenied == true,
+                    localRepositoryIsSafe = git.repository.repositoryState == org.eclipse.jgit.lib.RepositoryState.SAFE,
+                )
+            }
+        } catch (failure: Throwable) {
+            if (failure !is Exception && failure !is LinkageError) throw failure
+            errorSnapshot(checkedAt, "No se puede leer el estado local del workspace.", failure)
+                .copy(localStateIsFresh = false)
         }
     }
 
@@ -1349,7 +1387,8 @@ class RepositoryStateService(
 
     private fun inspectFetchedState(git: Git, checkedAt: Instant,
                                     performance: PullPerformanceRecorder? = null,
-                                    inspection: PullInspection = PullInspection.INITIAL): RepositoryStateSnapshot {
+                                    inspection: PullInspection = PullInspection.INITIAL,
+                                    remoteStateIsFresh: Boolean = true): RepositoryStateSnapshot {
         return syncMeasure(SyncPhase.INSPECT) {
             val repository = git.repository
             val (branch, localHead, remoteHead) = performance.measure(inspection.refs) {
@@ -1385,7 +1424,7 @@ class RepositoryStateService(
                 behind = relation.behind,
                 changes = changes,
                 checkedAt = checkedAt,
-                remoteStateIsFresh = true,
+                remoteStateIsFresh = remoteStateIsFresh,
             )
         }
     }

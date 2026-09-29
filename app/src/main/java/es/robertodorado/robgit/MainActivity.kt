@@ -178,6 +178,45 @@ private fun RobGitScreen(
     val aiContextBuilder = remember { AiContextBuilder() }
     val aiAssistantService = remember { AiAssistantService(FirebaseGeminiAiProvider()) }
 
+    val refreshLocalNow by rememberUpdatedState<suspend (RepositoryWatchTarget) -> RepositoryStateSnapshot>({ target ->
+        val config = requireNotNull(selectedRepository)
+        check(config.id == target.repositoryId)
+        val service = requireNotNull(repositoryService)
+        val previous = repositoryState
+        withContext(Dispatchers.IO) {
+            check(workspaceResolver.resolve(config) == target.directory)
+            gitOperations.refreshLocal(service, target.directory, previous)
+        }
+    })
+    val publishLocalState by rememberUpdatedState<(RepositoryStateSnapshot) -> Unit>({ result ->
+        repositoryState = result
+        if (result.localStateIsFresh) {
+            noticeTitle = null; noticeBody = null; noticeRecommendation = null
+        } else {
+            repositoryPrepared = false
+            noticeTitle = "Workspace no disponible."
+            noticeBody = result.message
+            noticeRecommendation = "Comprueba el acceso y pulsa el logo para volver a analizar."
+        }
+    })
+    val watcherFailure by rememberUpdatedState<(Exception) -> Unit>({ _ ->
+        repositoryState = repositoryState?.copy(type = RepositoryStateType.ERROR,
+            localStateIsFresh = false, remoteStateIsFresh = false, remoteCheckedAt = null)
+        repositoryPrepared = false
+        noticeTitle = "No se puede observar el workspace."
+        noticeBody = "Comprueba el acceso al repositorio y pulsa el logo para volver a analizar."
+        noticeRecommendation = null
+    })
+    val autoRefresh = remember(scope) {
+        RepositoryAutoRefresh(scope, AndroidRepositoryWatcherFactory(),
+            { refreshLocalNow(it) }, { publishLocalState(it) }, { watcherFailure(it) })
+    }
+    DisposableEffect(autoRefresh) { onDispose { autoRefresh.close() } }
+    fun setRunningOperation(label: String?) {
+        autoRefresh.operationActive(label != null)
+        runningOperation = label
+    }
+
     LaunchedEffect(authService) {
         withContext(Dispatchers.IO) { authService.restore() }
     }
@@ -236,7 +275,7 @@ private fun RobGitScreen(
         }
         sharedWorkspaceResult = null
         activeWorkspaceOperation = operationLabel
-        runningOperation = operationLabel
+        setRunningOperation(operationLabel)
         scope.launch {
             try {
                 val result = withContext(Dispatchers.IO) {
@@ -267,7 +306,7 @@ private fun RobGitScreen(
                 )
             } finally {
                 activeWorkspaceOperation = null
-                runningOperation = null
+                setRunningOperation(null)
             }
         }
     }
@@ -309,6 +348,7 @@ private fun RobGitScreen(
         }
     }
     fun clearRepositoryUi() {
+        autoRefresh.select(null)
         repositoryPrepared = null
         repositoryState = null
         lastOperation = null
@@ -325,7 +365,7 @@ private fun RobGitScreen(
         migrationDialogVisible = true
         migrationDialogError = null
         migrationPhase = MigrationPhase.PLANNED
-        runningOperation = "migrando"
+        setRunningOperation("migrando")
         scope.launch {
             try {
                 val completed = withContext(Dispatchers.IO) {
@@ -351,29 +391,29 @@ private fun RobGitScreen(
                 runCatching { withContext(Dispatchers.IO) { registry.load() } }.onSuccess { catalog = it }
                 runCatching { withContext(Dispatchers.IO) { migrationManager.pending() } }.onSuccess { pendingMigrations = it }
             } finally {
-                runningOperation = null
+                setRunningOperation(null)
             }
         }
     }
     fun selectRepository(id: String) {
         if (!repositorySelectorEnabled(runningOperation) || selectedRepository?.id == id) return
-        runningOperation = "seleccionando"
+        setRunningOperation("seleccionando")
         scope.launch {
             try {
                 val next = withContext(Dispatchers.IO) { registry.select(id) }
                 clearRepositoryUi()
                 uiRepositoryId = next.selectedRepositoryId
-                runningOperation = null
+                setRunningOperation(null)
                 catalog = next
             } catch (failure: Exception) {
-                runningOperation = null
+                setRunningOperation(null)
                 setNotice("No se pudo cambiar de repositorio.", failure.message.orEmpty())
             }
         }
     }
     fun addRepository(name: String, url: String, branch: String) {
         if (runningOperation != null) return
-        runningOperation = "añadiendo"
+        setRunningOperation("añadiendo")
         addError = null
         scope.launch {
             try {
@@ -381,11 +421,11 @@ private fun RobGitScreen(
                 clearRepositoryUi()
                 uiRepositoryId = next.selectedRepositoryId
                 showAddRepository = false
-                runningOperation = null
+                setRunningOperation(null)
                 catalog = next
             } catch (failure: Exception) {
                 addError = failure.message ?: "No se pudo añadir el repositorio."
-                runningOperation = null
+                setRunningOperation(null)
             }
         }
     }
@@ -393,10 +433,10 @@ private fun RobGitScreen(
         val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
         if (runningOperation != null) return
-        runningOperation = "analizando"; clearNotice()
+        setRunningOperation("analizando"); clearNotice()
         scope.launch {
             try {
-                val prepared = repositoryPrepared == true || withContext(Dispatchers.IO) { service.isPrepared(directory) }
+                val prepared = withContext(Dispatchers.IO) { RepositoryGitConcurrency.run { service.isPrepared(directory) } }
                 if (!prepared) {
                     repositoryPrepared = false
                     return@launch
@@ -408,14 +448,14 @@ private fun RobGitScreen(
                 if (result.authenticationRequired) setNotice(gitAuthMessage(), "Tus archivos locales permanecen intactos.")
             } catch (failure: GitAccessUnavailableException) {
                 setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
-            } finally { runningOperation = null }
+            } finally { setRunningOperation(null) }
         }
     }
     fun prepareRepository() {
         val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
         if (runningOperation != null) return
-        runningOperation = "preparando"; clearNotice()
+        setRunningOperation("preparando"); clearNotice()
         scope.launch {
             try {
                 val result = withContext(Dispatchers.IO) { gitOperations.prepare(service, directory) }
@@ -430,7 +470,7 @@ private fun RobGitScreen(
                 }
             } catch (failure: GitAccessUnavailableException) {
                 setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
-            } finally { runningOperation = null }
+            } finally { setRunningOperation(null) }
         }
     }
     fun pull() {
@@ -438,7 +478,7 @@ private fun RobGitScreen(
         val service = repositoryService ?: return
         val repositoryId = selectedRepository?.id ?: return
         if (runningOperation != null) return
-        runningOperation = "PULL"; clearNotice()
+        setRunningOperation("PULL"); clearNotice()
         scope.launch {
             val performance = PullPerformanceRecorder()
             try {
@@ -451,7 +491,7 @@ private fun RobGitScreen(
                 setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
             } finally {
                 PullPerformanceStore.process.record(repositoryId, performance.snapshot())
-                runningOperation = null
+                setRunningOperation(null)
             }
         }
     }
@@ -459,7 +499,7 @@ private fun RobGitScreen(
         val directory = operationDirectory() ?: return
         val service = repositoryService ?: return
         if (runningOperation != null) return
-        runningOperation = "PUSH"; clearNotice()
+        setRunningOperation("PUSH"); clearNotice()
         scope.launch {
             try {
                 val result = withContext(Dispatchers.IO) { gitOperations.push(service, directory, commitMessage) }
@@ -468,12 +508,12 @@ private fun RobGitScreen(
                 RepositoryStatusPresenter.present(result).let { setNotice(it.title, it.explanation, it.recommendation) }
             } catch (failure: GitAccessUnavailableException) {
                 setNotice(failure.message.orEmpty(), "No se realizó ningún push; tu trabajo local sigue intacto.")
-            } finally { runningOperation = null }
+            } finally { setRunningOperation(null) }
         }
     }
     fun requestPushCommitMessage() {
         if (runningOperation != null) return
-        runningOperation = "comprobando conexión con GitHub"
+        setRunningOperation("comprobando conexión con GitHub")
         clearNotice()
         scope.launch {
             try {
@@ -487,7 +527,7 @@ private fun RobGitScreen(
             } catch (failure: Exception) {
                 commitPurpose = null
                 setNotice(gitAuthMessage(), "No se realizó ningún push; tu trabajo local sigue intacto.")
-            } finally { runningOperation = null }
+            } finally { setRunningOperation(null) }
         }
     }
     fun synchronize(commitMessage: String = "Cambios desde RobGit") {
@@ -495,7 +535,7 @@ private fun RobGitScreen(
         val service = repositoryService ?: return
         val repositoryId = selectedRepository?.id ?: return
         if (runningOperation != null) return
-        runningOperation = "SINCRONIZAR"; clearNotice()
+        setRunningOperation("SINCRONIZAR"); clearNotice()
         scope.launch {
             val performance = SyncPerformanceRecorder()
             try {
@@ -510,7 +550,7 @@ private fun RobGitScreen(
                 setNotice(failure.message.orEmpty(), "Tus archivos locales permanecen intactos.")
             } finally {
                 SyncPerformanceStore.process.record(repositoryId, performance.snapshot())
-                runningOperation = null
+                setRunningOperation(null)
             }
         }
     }
@@ -522,7 +562,7 @@ private fun RobGitScreen(
         val service = repositoryService
         if (directory != null && service != null && repositoryPrepared == null) {
             try {
-                val prepared = withContext(Dispatchers.IO) { service.isPrepared(directory) }
+                val prepared = withContext(Dispatchers.IO) { RepositoryGitConcurrency.run { service.isPrepared(directory) } }
                 repositoryPrepared = prepared
             } catch (_: Exception) {
                 repositoryPrepared = false
@@ -533,6 +573,34 @@ private fun RobGitScreen(
         if (foregroundReturn > 0) {
             hasAllFilesAccess = Environment.isExternalStorageManager()
         }
+    }
+
+    LaunchedEffect(selectedRepository?.id, functionalRepository, repositoryPrepared, hasAllFilesAccess,
+        pendingMigrations, migrationJournalError) {
+        val target = if (repositoryPrepared == true && functionalRepository != null && !sharedAccessMissing &&
+            migrationJournalError == null && selectedPendingMigration == null)
+            RepositoryWatchTarget(requireNotNull(selectedRepository).id, functionalRepository) else null
+        autoRefresh.select(target)
+    }
+    var handledForegroundReturn by remember { mutableIntStateOf(0) }
+    LaunchedEffect(foregroundReturn, selectedRepository?.id, repositoryPrepared, pendingMigrations,
+        hasAllFilesAccess, migrationJournalError) {
+        if (foregroundReturn <= handledForegroundReturn) return@LaunchedEffect
+        // Allow the existing startup preparation/access checks to settle before consuming this return.
+        if (selectedRepository != null && pendingMigrations == null && migrationJournalError == null) return@LaunchedEffect
+        if (selectedRepository != null && repositoryPrepared == null && functionalRepository != null) return@LaunchedEffect
+        handledForegroundReturn = foregroundReturn
+        hasAllFilesAccess = Environment.isExternalStorageManager()
+        val directory = selectedRepository?.takeIf { selectedPendingMigration == null && migrationJournalError == null }
+            ?.let { runCatching { workspaceResolver.resolve(it) }.getOrNull() }
+        if (runningOperation != null || RepositoryGitConcurrency.isBusy) return@LaunchedEffect
+        if (directory != null && repositoryService != null) {
+            repositoryPrepared = withContext(Dispatchers.IO) { RepositoryGitConcurrency.run { repositoryService.isPrepared(directory) } }
+        }
+        val eligible = repositoryPrepared == true && directory != null && !sharedAccessMissing &&
+            selectedPendingMigration == null && migrationJournalError == null && runningOperation == null
+        // Deliberately skip a busy return: PULL/PUSH/SYNC already provide their own finalState.
+        if (autoRefresh.shouldAnalyzeOnForeground(eligible, RepositoryGitConcurrency.isBusy)) analyze()
     }
 
     val baseStatus = when {
@@ -604,14 +672,14 @@ private fun RobGitScreen(
 
     LaunchedEffect(showSettings, catalog) {
         if (showSettings) {
-            preparedRepositories = withContext(Dispatchers.IO) {
+            preparedRepositories = withContext(Dispatchers.IO) { RepositoryGitConcurrency.run {
                 catalog?.repositories?.associate { config ->
                     config.id to runCatching {
                         RepositoryStateService(repositoryUrl = config.remoteUrl, branch = config.branch)
                             .isPrepared(workspaceResolver.resolve(config))
                     }.getOrDefault(false)
                 }.orEmpty()
-            }
+            } }
         }
     }
     val technicalDirectory = functionalRepository ?: selectedRepository?.let {
@@ -648,19 +716,19 @@ private fun RobGitScreen(
                 else "Se quitará este repositorio de RobGit. Su carpeta privada permanecerá intacta.") },
             confirmButton = { TextButton(onClick = {
                 if (runningOperation != null) return@TextButton
-                runningOperation = "quitando"
+                setRunningOperation("quitando")
                 scope.launch {
                     try {
                         val next = withContext(Dispatchers.IO) { registry.remove(config.id) }
                         if (repositorySelectionNeedsReset(uiRepositoryId, next.selectedRepositoryId)) clearRepositoryUi()
                         uiRepositoryId = next.selectedRepositoryId
                         pendingRemoval = null
-                        runningOperation = null
+                        setRunningOperation(null)
                         catalog = next
                         showSettings = true
                     } catch (failure: Exception) {
                         pendingRemoval = null
-                        runningOperation = null
+                        setRunningOperation(null)
                         setNotice("No se pudo quitar el repositorio.", failure.message.orEmpty())
                     }
                 }
@@ -725,18 +793,18 @@ private fun RobGitScreen(
         { config -> showSettings = false; pendingRemoval = config },
         { config -> showSettings = false; confirmMigration = config },
         {
-            runningOperation = "diagnóstico local"; scope.launch {
+            setRunningOperation("diagnóstico local"); scope.launch {
                 localDiagnostic = withContext(Dispatchers.IO) { gitService.runLocalDiagnostic(File(diagnosticRoot, UUID.randomUUID().toString())) }
-                runningOperation = null
+                setRunningOperation(null)
             }
         }, {
-            runningOperation = "diagnóstico clone"; scope.launch {
+            setRunningOperation("diagnóstico clone"); scope.launch {
                 remoteDiagnostic = withContext(Dispatchers.IO) { gitService.runRemoteCloneDiagnostic(File(diagnosticRoot, "remote-clones/${UUID.randomUUID()}")) }
-                runningOperation = null
+                setRunningOperation(null)
             }
         }, {
             if (runningOperation == null) {
-                runningOperation = "diagnóstico push"
+                setRunningOperation("diagnóstico push")
                 scope.launch {
                     try {
                         pushDiagnostic = withContext(Dispatchers.IO) {
@@ -745,7 +813,7 @@ private fun RobGitScreen(
                         }
                     } catch (failure: GitAccessUnavailableException) {
                         setNotice(failure.message.orEmpty(), "No se realizó ningún push de diagnóstico.")
-                    } finally { runningOperation = null }
+                    } finally { setRunningOperation(null) }
                 }
             }
         }, {
@@ -1015,7 +1083,10 @@ private fun TechnicalDetailsDialog(config: RepositoryConfig?, directory: File?, 
                 Text("Rama actual: ${state.branch ?: "desconocida"}"); Text("HEAD: ${state.localHead ?: "desconocido"}"); Text("origin/${config?.branch ?: "?"}: ${state.remoteHead ?: "desconocido"}")
                 Text("Ahead: ${state.ahead} · Behind: ${state.behind}"); Text("Working tree: ${if (state.changes.hasChanges) "con cambios" else "limpio"}")
                 TechnicalFiles("Nuevos", state.changes.newFiles); TechnicalFiles("Modificados", state.changes.modifiedFiles); TechnicalFiles("Eliminados", state.changes.deletedFiles); TechnicalFiles("Staged", state.changes.stagedFiles); TechnicalFiles("Conflictos", state.changes.conflictingFiles)
-                Text("Remoto actualizado: ${if (state.remoteStateIsFresh) "sí" else "no"}"); Text("Comprobado: ${state.checkedAt}"); state.error?.let { Text("Error: $it", color = RobGitColors.Error) }
+                Text("Estado local leído: ${state.checkedAt}")
+                Text("Remoto actualizado en esta comprobación: ${if (state.remoteStateIsFresh) "sí" else "no"}")
+                Text("Última comprobación remota válida: ${state.remoteCheckedAt ?: "desconocida"}")
+                state.error?.let { Text("Error: $it", color = RobGitColors.Error) }
             }
             operation?.let { Text("Última operación: ${it.operation} — ${it.outcome}") }
         }

@@ -6,6 +6,11 @@ import java.io.File
 internal class GitHubGitOperations(private val access: GitHubAccessTokenProvider) {
     private suspend fun <T> withCredentials(required: Boolean, performance: PullPerformanceRecorder? = null,
                                            syncPerformance: SyncPerformanceRecorder? = null,
+                                           action: suspend (CharArray, Boolean) -> T): T =
+        RepositoryGitConcurrency.run { withCredentialsUnlocked(required, performance, syncPerformance, action) }
+
+    private suspend fun <T> withCredentialsUnlocked(required: Boolean, performance: PullPerformanceRecorder?,
+                                           syncPerformance: SyncPerformanceRecorder?,
                                            action: suspend (CharArray, Boolean) -> T): T {
         val token = syncPerformance.measureSuspending(SyncPhase.OAUTH) {
             performance.measureSuspending(PullPhase.OAUTH) {
@@ -29,7 +34,7 @@ internal class GitHubGitOperations(private val access: GitHubAccessTokenProvider
     }
 
     suspend fun prepare(service: RepositoryGitEngine, directory: File): RepositoryPreparationResult {
-        if (directory.exists()) return service.prepare(directory, charArrayOf())
+        if (directory.exists()) return RepositoryGitConcurrency.run { service.prepare(directory, charArrayOf()) }
         return withCredentials(false) { token, authenticated ->
             val result = service.prepare(directory, token)
             if (authenticated && result.authenticationRejected) access.reportAuthenticationRejected()
@@ -46,6 +51,11 @@ internal class GitHubGitOperations(private val access: GitHubAccessTokenProvider
             if (authenticated && result.authenticationRequired && !result.authenticationRejected)
                 result.copy(repositoryAccessDenied = true) else result
         }
+
+    /** Deliberately bypasses OAuth as well as the remote engine API. */
+    suspend fun refreshLocal(service: RepositoryLocalStateReader, directory: File,
+                             previous: RepositoryStateSnapshot?): RepositoryStateSnapshot =
+        RepositoryGitConcurrency.run { service.refreshLocalState(directory, previous) }
 
     suspend fun pull(service: RepositoryGitEngine, directory: File,
                      performance: PullPerformanceRecorder? = null): DownloadResult =
