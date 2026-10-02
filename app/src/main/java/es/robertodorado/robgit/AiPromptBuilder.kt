@@ -2,6 +2,15 @@ package es.robertodorado.robgit
 
 internal class AiPromptBuilder {
 
+    /** Stable model instruction: universal identity first, then RobGit-specific boundaries. */
+    fun systemInstruction(): String = buildString {
+        appendLine("PERSONALIDAD DE RODO (versión ${RodoPersonality.VERSION}):")
+        appendLine(RodoPersonality.systemPrompt)
+        appendLine()
+        appendLine("CONTEXTO Y REGLAS DE ROBGIT:")
+        append(RodoRobGitContext.systemPrompt)
+    }
+
     fun build(request: AiRequest): String {
         val context = request.context
 
@@ -47,20 +56,6 @@ internal class AiPromptBuilder {
         }
 
         return buildString {
-            appendLine("Eres Rodo, el asistente personal de Roberto. En este contexto estás integrado en RobGit, una aplicación Android para usar Git de forma segura.")
-            appendLine("Puedes dirigirte a Roberto por su nombre cuando resulte natural, sin repetir una presentación artificial como 'Hola Roberto, soy Rodo' en cada respuesta.")
-            appendLine("Mantén un tono cercano y profesional. No finjas capacidades que no tienes.")
-            appendLine()
-            appendLine("REGLAS:")
-            appendLine("- No puedes ejecutar ninguna operación Git.")
-            appendLine("- No puedes modificar archivos.")
-            appendLine("- No puedes realizar push, pull, merge, reset, force push ni borrar nada.")
-            appendLine("- Solo analizas y explicas información.")
-            appendLine("- No inventes datos ausentes.")
-            appendLine("- Responde en castellano de España.")
-            appendLine("- Sé claro, práctico y conciso.")
-            appendLine("- Responde en texto plano. No uses Markdown, asteriscos, almohadillas ni formato especial.")
-            appendLine()
             appendLine("TAREA:")
             appendLine(taskInstruction)
             appendLine()

@@ -3,6 +3,7 @@ package es.robertodorado.robgit
 import com.google.firebase.Firebase
 import com.google.firebase.ai.ai
 import com.google.firebase.ai.type.GenerativeBackend
+import com.google.firebase.ai.type.content
 
 internal class FirebaseGeminiAiProvider(
     private val promptBuilder: AiPromptBuilder = AiPromptBuilder(),
@@ -12,7 +13,8 @@ internal class FirebaseGeminiAiProvider(
         Firebase.ai(
             backend = GenerativeBackend.googleAI()
         ).generativeModel(
-            modelName = MODEL_NAME
+            modelName = MODEL_NAME,
+            systemInstruction = content { text(promptBuilder.systemInstruction()) },
         )
     }
 
