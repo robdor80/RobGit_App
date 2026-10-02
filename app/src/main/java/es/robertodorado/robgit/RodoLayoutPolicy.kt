@@ -5,7 +5,7 @@ internal enum class RobGitLayoutMode {
     TABLET_PORTRAIT,
     TABLET_LANDSCAPE;
 
-    val hasPersistentRodoCard: Boolean get() = this == TABLET_PORTRAIT
+    val hasPersistentRodoCard: Boolean get() = this != PHONE
     val hasSingleRowActions: Boolean get() = this == TABLET_PORTRAIT
 }
 
@@ -21,6 +21,10 @@ internal fun portraitNeedsScrollableFallback(heightDp: Float): Boolean = heightD
 /** Bounds the response viewport in dp; the card itself still wraps short content. */
 internal fun rodoCardMaxHeight(availableHeightDp: Float): Float =
     (availableHeightDp * .58f).coerceIn(240f, 440f)
+
+/** Reserve the left column's repository and status cards before bounding Rodo's response. */
+internal fun landscapeRodoCardMaxHeight(availableHeightDp: Float): Float =
+    (availableHeightDp - 280f).coerceIn(240f, 440f)
 
 internal data class ActionIdentity(val icon: String, val label: String, val action: RepositoryAction)
 

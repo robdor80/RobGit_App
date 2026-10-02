@@ -19,10 +19,11 @@ class RodoLayoutPolicyTest {
         assertTrue(layout.hasSingleRowActions)
     }
 
-    @Test fun landscapeTabletKeepsExistingStructure() {
+    @Test fun landscapeTabletUsesSharedCardWithoutChangingItsActionGrid() {
         val layout = robGitLayoutMode(600, 1280f, 800f)
         assertEquals(RobGitLayoutMode.TABLET_LANDSCAPE, layout)
-        assertFalse(layout.hasPersistentRodoCard || layout.hasSingleRowActions)
+        assertTrue(layout.hasPersistentRodoCard)
+        assertFalse(layout.hasSingleRowActions)
     }
 
     @Test fun squareTabletUsesPortraitPolicyUntilWidthExceedsHeight() {
@@ -53,5 +54,12 @@ class RodoLayoutPolicyTest {
         assertEquals(348f, rodoCardMaxHeight(600f), .001f)
         assertEquals(440f, rodoCardMaxHeight(1200f))
         assertTrue(rodoCardMaxHeight(1200f) < 1200f)
+    }
+
+    @Test fun landscapeCardMaximumLeavesRoomForRepositoryAndStatusAndBoundsLongAnswers() {
+        assertEquals(240f, landscapeRodoCardMaxHeight(450f))
+        assertEquals(340f, landscapeRodoCardMaxHeight(620f))
+        assertEquals(440f, landscapeRodoCardMaxHeight(900f))
+        assertTrue(landscapeRodoCardMaxHeight(900f) < 900f)
     }
 }

@@ -689,38 +689,63 @@ private fun RobGitScreen(
                             { showAi = true }, rodoState is RodoState.Thinking)
                     }
                 }
+            } else if (landscapeTablet) {
+                Box(Modifier.fillMaxSize().navigationBarsPadding().padding(outerPadding),
+                    contentAlignment = Alignment.TopCenter) {
+                    Column(Modifier.fillMaxWidth().widthIn(max = RobGitDimens.ContentMax).fillMaxHeight()) {
+                        RobGitHeader({ analyze() }, { showTechnical = true }, { showSettings = true })
+                        Spacer(Modifier.height(18.dp))
+                        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth()) {
+                            val cardMaxHeight = landscapeRodoCardMaxHeight(maxHeight.value).dp
+                            Row(Modifier.fillMaxSize(), horizontalArrangement = Arrangement.spacedBy(28.dp)) {
+                                Column(Modifier.weight(1.15f).fillMaxHeight()
+                                    .verticalScroll(rememberScrollState())) {
+                                    RepositorySelector(catalog, repositorySelectorEnabled(runningOperation),
+                                        ::selectRepository, { showAddRepository = true })
+                                    Spacer(Modifier.height(22.dp))
+                                    HumanStatusPanel(displayedStatus, runningOperation != null,
+                                        repositoryPrepared == false && supportActionLabel == null &&
+                                            workspaceResolutionError == null && migrationJournalError == null,
+                                        selectedRepository == null && catalog != null,
+                                        { prepareRepository() }, { showAddRepository = true },
+                                        supportActionLabel, supportAction)
+                                    Spacer(Modifier.height(34.dp))
+                                    RodoPanel(rodoState, Modifier.fillMaxWidth().heightIn(max = cardMaxHeight))
+                                }
+                                Column(Modifier.weight(.85f).fillMaxHeight()
+                                    .verticalScroll(rememberScrollState())) {
+                                    ActionGrid(baseStatus,
+                                        functionalRepository != null && repositoryPrepared == true && runningOperation == null,
+                                        { pull() }, ::requestPushCommitMessage,
+                                        { if (baseStatus.recommendedAction == RepositoryAction.PUSH ||
+                                            baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE)
+                                            commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
+                                        { showAi = true }, Modifier.fillMaxWidth(),
+                                        rodoState is RodoState.Thinking)
+                                }
+                            }
+                        }
+                    }
+                }
             } else Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(outerPadding), horizontalAlignment = Alignment.CenterHorizontally) {
                 Column(Modifier.fillMaxWidth().widthIn(max = RobGitDimens.ContentMax)) {
                     RobGitHeader({ analyze() }, { showTechnical = true }, { showSettings = true })
                     Spacer(Modifier.height(18.dp))
-                    if (landscapeTablet) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(28.dp), modifier = Modifier.fillMaxWidth()) {
-                            Column(Modifier.weight(1.15f)) {
-                                RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
-                                HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
-                            }
-                            ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
-                                ::requestPushCommitMessage,
-                                { if (baseStatus.recommendedAction == RepositoryAction.PUSH || baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
-                                { showAi = true }, Modifier.weight(.85f), rodoState is RodoState.Thinking)
-                        }
-                    } else {
-                        RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
-                        HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
-                        Spacer(Modifier.height(if (tablet) 28.dp else 22.dp))
-                        ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
-                            ::requestPushCommitMessage,
-                            { if (baseStatus.recommendedAction == RepositoryAction.PUSH || baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
-                            { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp),
-                            rodoState is RodoState.Thinking)
-                    }
+                    RepositorySelector(catalog, repositorySelectorEnabled(runningOperation), ::selectRepository, { showAddRepository = true }); Spacer(Modifier.height(22.dp))
+                    HumanStatusPanel(displayedStatus, runningOperation != null, repositoryPrepared == false && supportActionLabel == null && workspaceResolutionError == null && migrationJournalError == null, selectedRepository == null && catalog != null, { prepareRepository() }, { showAddRepository = true }, supportActionLabel, supportAction)
+                    Spacer(Modifier.height(22.dp))
+                    ActionGrid(baseStatus, functionalRepository != null && repositoryPrepared == true && runningOperation == null, { pull() },
+                        ::requestPushCommitMessage,
+                        { if (baseStatus.recommendedAction == RepositoryAction.PUSH || baseStatus.recommendedAction == RepositoryAction.SYNCHRONIZE) commitPurpose = CommitPurpose.SYNCHRONIZE else synchronize() },
+                        { showAi = true }, Modifier.align(Alignment.CenterHorizontally).widthIn(max = 440.dp),
+                        rodoState is RodoState.Thinking)
                 }
             }
             if (showAi) AiAssistantDialog(
                 context = aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,
                     lastOperation?.let { AiLastOperation(it.operation, it.outcome, it.message, it.detail) }),
                 state = rodoState,
-                showResultInDialog = layoutMode != RobGitLayoutMode.TABLET_PORTRAIT,
+                showResultInDialog = !layoutMode.hasPersistentRodoCard,
                 onSubmit = { task, question ->
                     rodoSession.submit(task,
                         aiContextBuilder.build(selectedRepository, repositoryState, displayedStatus,

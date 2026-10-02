@@ -9,7 +9,7 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,10 +32,15 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
@@ -88,14 +93,17 @@ internal fun AnimatedRodo(state: RodoState, size: Dp, modifier: Modifier = Modif
     })
 }
 
-/** Persistent only in tablet portrait; the animated mascot lives in the title, never the body. */
+/** One shared tablet card; the transparent mascot lives in the title, never the body. */
 @Composable
 internal fun RodoPanel(state: RodoState, modifier: Modifier = Modifier) {
+    val titleStyle = MaterialTheme.typography.titleMedium
+    val titleWidth = rememberTextMeasurer().measure(
+        AnnotatedString("Rodo"), style = titleStyle.copy(fontWeight = FontWeight.Bold),
+    ).size.width
     Box(modifier) {
         Column(
             Modifier.fillMaxWidth()
                 .padding(top = 68.dp)
-                .border(RobGitDimens.Border, RobGitColors.Ice, RoundedCornerShape(RobGitDimens.Radius))
                 .background(RobGitColors.PetroleumDark.copy(alpha = .58f), RoundedCornerShape(RobGitDimens.Radius))
                 .padding(start = 24.dp, end = 24.dp, top = 78.dp, bottom = 20.dp),
         ) {
@@ -133,9 +141,36 @@ internal fun RodoPanel(state: RodoState, modifier: Modifier = Modifier) {
                 }
             }
         }
+        // Leave a genuine opening in the top stroke. No opaque header background is
+        // painted behind the WebP's transparent pixels.
+        Canvas(Modifier.matchParentSize()) {
+            val stroke = RobGitDimens.Border.toPx()
+            val inset = stroke / 2f
+            val radius = RobGitDimens.Radius.toPx()
+            val top = 68.dp.toPx()
+            val right = size.width - inset
+            val bottom = size.height - inset
+            val gapStart = 25.dp.toPx()
+            val gapEnd = ((27 + 6 + 144 + 5 + 8 + 6).dp.toPx() + titleWidth)
+                .coerceAtMost(right - radius)
+            val outline = Path().apply {
+                moveTo(inset + radius, top)
+                lineTo(gapStart, top)
+                moveTo(gapEnd, top)
+                lineTo(right - radius, top)
+                arcTo(Rect(right - 2 * radius, top, right, top + 2 * radius), 270f, 90f, false)
+                lineTo(right, bottom - radius)
+                arcTo(Rect(right - 2 * radius, bottom - 2 * radius, right, bottom), 0f, 90f, false)
+                lineTo(inset + radius, bottom)
+                arcTo(Rect(inset, bottom - 2 * radius, inset + 2 * radius, bottom), 90f, 90f, false)
+                lineTo(inset, top + radius)
+                arcTo(Rect(inset, top, inset + 2 * radius, top + 2 * radius), 180f, 90f, false)
+            }
+            drawPath(outline, RobGitColors.Ice, style = Stroke(width = stroke))
+        }
         Row(
             modifier = Modifier.align(Alignment.TopStart).padding(start = 27.dp)
-                .background(RobGitColors.Petroleum).padding(horizontal = 6.dp),
+                .padding(horizontal = 6.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             Box(Modifier.size(144.dp), contentAlignment = Alignment.Center) {
